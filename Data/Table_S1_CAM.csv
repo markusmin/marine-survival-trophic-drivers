@@ -1,0 +1,60 @@
+,Taxonomy,Life History Stages,CAM Life History,Functional Group,Proportion of Functional Group
+1,Cancer oregonensis/productus,"Megalopa, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Cancer crab larvae,0.777
+2,Cancer antennarius/gracilis,"Megalopa, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Cancer crab larvae,0.178
+3,Cancer magister,"Megalopa, Z1, Zoea I, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Cancer crab larvae,0.045
+4,Cancer antennarius,Megalopa,"Lump with #2. I think it is a mistake, but would have to check the paper datasheet. I don't know how to tell the difference between this and gracilis unless I had help",Cancer crab larvae,0
+5,Cancer spp.,Juvenile,Juvenile - although I don't know if this really should be included. They should be benthic by this stage!,Cancer crab larvae,0
+6,Themisto pacifica,"Juvenile, Larva, Unknown",Juvenile,Hyperiid amphipod,0.939
+7,Hyperoche,"Juvenile, Unknown",Juvenile,Hyperiid amphipod,0.044
+8,Vibilia australis,"Juvenile, Unknown",Juvenile,Hyperiid amphipod,0.007
+9,Hyperia medusarum,"Juvenile, Unknown",Juvenile,Hyperiid amphipod,0.006
+10,Lycaea pulex,"Juvenile, Unknown",Juvenile,Hyperiid amphipod,0.002
+11,Vibilia pyripes,"Juvenile, Unknown",Juvenile,Hyperiid amphipod,0.002
+12,Phronima spp.,Unknown,Juvenile,Hyperiid amphipod,0
+13,Dairella californica,Unknown,Juvenile,Hyperiid amphipod,0
+14,Streetsia challengeri,Unknown,Juvenile,Hyperiid amphipod,0
+15,Primno spp.,"Juvenile, Unknown",Juvenile,Hyperiid amphipod,0
+16,Oxycephalus,Unknown,Juvenile,Hyperiid amphipod,0
+17,Vibilia spp.,Unknown,Juvenile,Hyperiid amphipod,0
+18,Porcellanidae,"Megalopa, Z1, Zoea I, Z2, Zoea II","Zoea, Megalopa",Non-Cancer crab larvae,0.451
+19,Fabia,"Megalopa, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V, Zoea","Zoea, Megalopa",Non-Cancer crab larvae,0.204
+20,Lophopanopeus,"Megalopa, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Non-Cancer crab larvae,0.14
+21,Paguridae,"Megalopa, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V, Zoea","Zoea, Megalopa",Non-Cancer crab larvae,0.066
+22,Emerita analoga,"Z1, Zoea I, Z5, Zoea V",Zoea,Non-Cancer crab larvae,0.039
+23,Pinnixa,"Megalopa, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Non-Cancer crab larvae,0.037
+24,Pugettia,"Megalopa, Z1, Zoea I, Z2, Zoea II, Zoea","Zoea, Megalopa",Non-Cancer crab larvae,0.029
+25,Hemigrapsus,"Megalopa, Z1, Zoea I, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Non-Cancer crab larvae,0.015
+26,Grapsidae,"Megalopa, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Non-Cancer crab larvae,0.011
+27,Majidae,"Megalopa, Z1, Zoea I, Z3, Zoea III, Z5, Zoea V","Zoea, Megalopa",Non-Cancer crab larvae,0.004
+28,Pinnotheridae,"Juvenile, Megalopa, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V","Zoea, Megalopa",Non-Cancer crab larvae,0.003
+29,Oregonia gracilis,Megalopa,Megalopa,Non-Cancer crab larvae,0.001
+30,Pinnixa littoralis,"Megalopa, Z5, Zoea V","Zoea, Megalopa",Non-Cancer crab larvae,0
+31,Rhithropanopeus harrisii,Megalopa,Megalopa,Non-Cancer crab larvae,0
+32,Xanthidae,"Juvenile, Zoea","Zoea, Juvenile",Non-Cancer crab larvae,0
+33,"Pugettia, not productus",Megalopa,Combine with #24?,Non-Cancer crab larvae,0
+34,Hemigrapsus nudus,Megalopa,Megalopa,Non-Cancer crab larvae,0
+35,Pachycheles rudis,Megalopa,Combine #35 & 36?,Non-Cancer crab larvae,0
+36,Pachycheles,Megalopa,Combine #35 & 36?,Non-Cancer crab larvae,0
+37,Pugettia producta,Megalopa,Combine with #24?,Non-Cancer crab larvae,0
+38,Cancer oregonensis,"Z5, Zoea V",Lump with #1,Non-Cancer crab larvae,0
+39,Crabs,Juvenile,Juvenile,Non-Cancer crab larvae,0
+40,Pugettia gracilis,"Megalopa, Z2, Zoea II",Combine with #24?,Non-Cancer crab larvae,0
+41,Telmessus cheiragonus,Juvenile,Juvenile,Non-Cancer crab larvae,0
+42,Neotrypaea californiensis,"Juvenile, Larva, Megalopa, Unknown, Z1, Zoea I, Z2, Zoea II, Z3, Zoea III, Z4, Zoea IV, Z5, Zoea V, Zoea","Zoea, Megalopa",Shrimp larvae,0.829
+43,Crangonidae,"Juvenile, Larva, Unknown","Juvenile, Larva",Shrimp larvae,0.125
+44,Hippolytidae,"Juvenile, Larva, Unknown","Juvenile, Larva",Shrimp larvae,0.03
+45,Cumacea,"Juvenile, Larva, Unknown","Juvenile, Larva",Shrimp larvae,0.014
+46,Neomysis kadiakensis,"Juvenile, Unknown","Juvenile, Larva",Shrimp larvae,0
+47,Pandalidae,"Juvenile, Larva, Unknown","Juvenile, Larva",Shrimp larvae,0
+48,Sergestidae,"Juvenile, Larva","Juvenile, Larva",Shrimp larvae,0
+49,Alienacanthomysis macropsis,"Juvenile, Larva, Unknown",Larva,Shrimp larvae,0
+50,Upogebia pugettensis,"Larva, Megalopa, Z3, Zoea III","Zoea, Megalopa",Shrimp larvae,0
+51,Mysidacea,"Juvenile, Larva, Unknown",Larva,Shrimp larvae,0
+52,Natantia,Larva,Larva,Shrimp larvae,0
+53,Neomysis rayii,"Juvenile, Larva","Juvenile, Larva",Shrimp larvae,0
+54,Neomysis mercedis,"Juvenile, Larva","Juvenile, Larva",Shrimp larvae,0
+55,Archaeomysis grebnitzkii,"Larva, Unknown",Larva,Shrimp larvae,0
+56,Crangon spp.,Juvenile,Lump with #43,Shrimp larvae,0
+57,"Cumacea, lg type",Unknown,Lump with# 45,Shrimp larvae,0
+58,Exacanthomysis davisi,Juvenile,Juvenile,Shrimp larvae,0
+59,Lissocrangon stylirostris,Juvenile,Juvenile,Shrimp larvae,0
