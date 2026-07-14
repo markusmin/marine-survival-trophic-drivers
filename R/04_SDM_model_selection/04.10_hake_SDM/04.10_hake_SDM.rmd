@@ -1,0 +1,3067 @@
+---
+title: "04.10_hake_SDM"
+author: "Markus Min"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Description
+
+In this document, we conduct the model selection process for age 2+ hake from the hake ATM survey data. We identify the best fit model, which is then used to model the distribution of hake in the joint distribution models found in the folder `/05_stage1_SDM`.
+
+
+### Model selection steps
+
+1. Fit a "base" model, that includes all fixed effects but no random effects.
+
+2. Use this base model to tune the structure of the spatial and spatiotemporal random effects using cAIC as the information criterion.
+
+3. Keeping the random effects structure identified in step 2 fixed, identify the fixed effect structure for our covariates (year, temperature, distance from shore), again using cAIC as the information criterion. This includes exploring two alternative functional forms for temperature and distance from shore: linear and p-splines.
+
+```{r chunk-options, message = FALSE, echo = FALSE, warning = FALSE}
+# set chunk options
+knitr::opts_chunk$set(message = FALSE, echo = FALSE, warning = FALSE)
+```
+
+
+## Data preparation for model selection process
+
+```{r load_libraries_source_scripts, include = FALSE}
+library(tidyverse)
+library(here)
+library(TMB)
+library(ggforce)
+library(sdmTMB)
+library(kableExtra)
+library(mgcv)
+
+# source the function scripts
+source("R/functions/cAIC.R")
+source("R/functions/rmvnorm_prec.R")
+source("R/functions/sample_var.R")
+source("R/functions/plot_anisotropy_MM.R")
+source("R/functions/make_anisotropy_spde.R")
+source("R/functions/H_matrix_prior_predictive_check_for_ggplot.R")
+source("R/functions/plot_distribution_PRS_PWCC.R")
+source("R/functions/generate_prediction_maps_hake_survey.R")
+source("R/functions/sdmTMB_smoothing_functions.R")
+
+# source the script to load spatial data and create the mesh
+source(here::here("R", "hake_survey_make_mesh.R"))
+```
+
+```{r data_prep}
+#### prep model data ####
+# generate the projection vector/matrix for covariates - this relies
+# on the survey prediction grid from the PRS_PWCC_make_mesh.R script
+
+distance_projection_vector <- as.numeric(filter(survey_predict_grid_jsoes_hake_years, year == 2017)$dist_shore_scaled)
+
+# for SST - take prediction grid, drop salinity, add SST with locations as rows and years as column
+survey_predict_grid_jsoes_hake_years %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix
+
+# create a second temperature projection grid that contains the missing years
+survey_predict_grid_jsoes_hake_allyears %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix_hake_allyears
+
+
+#### Create SPDE objects ####
+
+# there are multiple meshes that are created in JSOES_make_mesh.R
+# here, we will use the cutoff 15 mesh, although a higher resolution is likely going
+# to improve results (at the cost of run time)
+
+hake_survey_spde <- fm_fem( hake_inla_mesh_cutoff15_jsoes_domain, 
+                order = 2 )
+
+# create projection matrix from vertices to samples
+A_is_hake = fm_evaluator(hake_inla_mesh_cutoff15_jsoes_domain, loc = as.matrix(data.frame(X = hake$X, Y = hake$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+A_gs_hake = fm_evaluator( hake_inla_mesh_cutoff15_jsoes_domain, loc=st_coordinates(survey_domain_jsoes_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_hake <- make_anisotropy_spde( hake_inla_mesh_cutoff15_jsoes_domain )
+
+# create projection matrix from vertices to prediction grid
+# use the prediction grid for only the JSOES domain here
+
+#### Create a survey prediction grid 
+# Create a survey grid from scratch, using SST data
+
+# only keep one year, since that's all we need to make a grid
+SST_sf_proj %>% 
+  filter(year == 2000) -> SST_sf_proj_2000
+
+st_as_sf(SST_sf_proj_2000$geometry/1000, crs = UTM_zone_10_crs) -> SST_sf_proj_km_2000
+
+SST_sf_proj_km_2000$dist_shore <- as.numeric(st_distance(SST_sf_proj_km_2000, US_west_coast_proj_km))
+
+
+# KEY DECISION: To what area do you want to project the SDM to?
+# Some observations of the data:
+# The vast majority of stations are within 60 km of shore, but there are just a couple 
+# that are further out in the Columbia River Plume up to 83 km from shore
+# a NASC of 15 tows (out of over 2000) are >= 35 nmi (65 km) offshore; many more are 30 or 31 nmi (55.5 or 57.4 km) offshore.
+# We also want to exclude values that are within 0.5 km of shore, because these
+# don't have measureable SST values (they're basically on shore)
+# this can also be seen in the following histogram:
+# hist(jsoes_long$km_from_shore)
+
+# For the N/S dimension, the most northerly transect is typically the FS transect and 
+# the most southerly transect is the NH transect.
+# this corresponds to 44.67 to 48.23 N
+# Let's take these as our N/S boundaries and add 10 km as a buffer.
+min_Y <- mean(subset(jsoes_long, grepl("NH", station))$Y)
+max_Y <- mean(subset(jsoes_long, grepl("FS", station))$Y)
+
+# Based on this, I'm going to propose that we generate a prediction that extends:
+# from 0.5 to 65 km offshore
+# from 44.67 to 48.23 N (+ 10 km on either side)
+
+# trim longitudinally
+SST_sf_proj_km_2000 %>% 
+  filter(dist_shore <= 65 & dist_shore >= 0.5) -> grid_within_65km_shore
+
+# trim latitudinally
+survey_domain <- st_crop(grid_within_65km_shore, xmin = 0, xmax = 100000, ymin=min_Y-10, ymax=max_Y+10)
+
+# let's inspect the grid that we created
+# ggplot(survey_domain) +
+#   geom_sf()
+
+# We will need to manually trim out some of these areas
+
+# manually remove sections for strait, hood canal (and other inland waters), Grays Harbor, Willapa Bay, Columbia River estuary
+strait <- st_as_sfc(st_bbox(c(xmin=-124.65, xmax=-122, ymin=47.9375, ymax=49), crs = "WGS84"))
+strait_proj <- sf::st_transform(strait, crs = UTM_zone_10_crs)
+strait_proj_km <- st_as_sf(strait_proj/1000, crs = UTM_zone_10_crs)
+
+inland_waters <- st_as_sfc(st_bbox(c(xmin=-123.5, xmax=-120, ymin=44, ymax=49.5), crs = "WGS84"))
+inland_waters_proj <- sf::st_transform(inland_waters, crs = UTM_zone_10_crs)
+inland_waters_proj_km <- st_as_sf(inland_waters_proj/1000, crs = UTM_zone_10_crs)
+
+grays_harbor <- st_as_sfc(st_bbox(c(xmin=-124.15, xmax=-123.6, ymin=46.83, ymax=47.09), crs = "WGS84"))
+grays_harbor_proj <- sf::st_transform(grays_harbor, crs = UTM_zone_10_crs)
+grays_harbor_proj_km <- st_as_sf(grays_harbor_proj/1000, crs = UTM_zone_10_crs)
+
+willapa_bay <- st_as_sfc(st_bbox(c(xmin=-124.06, xmax=-123.5, ymin=46.34, ymax=46.8), crs = "WGS84"))
+willapa_bay_proj <- sf::st_transform(willapa_bay, crs = UTM_zone_10_crs)
+willapa_bay_proj_km <- st_as_sf(willapa_bay_proj/1000, crs = UTM_zone_10_crs)
+
+estuary <- st_as_sfc(st_bbox(c(xmin=-124.02, xmax=-123.5, ymin=46.12, ymax=46.35), crs = "WGS84"))
+estuary_proj <- sf::st_transform(estuary, crs = UTM_zone_10_crs)
+estuary_proj_km <- st_as_sf(estuary_proj/1000, crs = UTM_zone_10_crs)
+
+survey_domain %>% 
+  st_difference(., strait_proj_km) %>% 
+  st_difference(., inland_waters_proj_km) %>% 
+  st_difference(., grays_harbor_proj_km) %>% 
+  st_difference(., willapa_bay_proj_km) %>% 
+  st_difference(., estuary_proj_km) -> survey_domain
+
+# Create a concave hull around points
+st_concave_hull(st_union(survey_domain), ratio = 0.1) -> survey_domain_polygon
+
+# ggplot(survey_domain_polygon) +
+#   geom_sf()
+
+# ggplot(survey_domain) +
+#   geom_sf()
+
+# let's inspect our revised survey domain
+survey_area_basemap_km +
+  geom_sf(data = survey_domain_polygon, fill = "blue", alpha = 0.2)
+
+# Take SST grid and intersect with survey domain
+SST_sf_proj %>% 
+  mutate(geometry = geometry/1000) %>% 
+  st_set_crs(UTM_zone_10_crs) %>% 
+  st_intersection(survey_domain_polygon) %>% 
+  dplyr::select(SST, year, geometry)-> SST_survey_domain
+
+survey_area_basemap_km +
+  geom_sf(data = SST_survey_domain, fill = "blue", alpha = 0.2)
+
+# add in distance from shore - this is now your survey domain, with covariates
+SST_survey_domain %>% 
+  mutate(sf_dist_shore = as.numeric(st_distance(geometry, US_west_coast_proj_km))) -> survey_domain_cov
+survey_domain_cov <- st_as_sf(survey_domain_cov, coords = c("X", "Y"), crs = UTM_zone_10_crs)
+
+
+
+# because the survey_domain_polygon is constructed from a concave hull, some of the borders
+# are a little coarse - and as a result some of the super nearshore data snuck back it.
+# filter it out
+survey_domain_cov %>% 
+  filter(sf_dist_shore >= 0.5) -> survey_domain_cov
+
+
+# extract the grid for the projection area - the grid dimensions are the same each year, so just select one year and drop fields besides geometry
+survey_domain_cov %>% 
+  filter(year == 2016) %>% 
+  dplyr::select(geometry) -> survey_domain_cov_grid
+```
+
+
+# Model selection process
+
+## Step 1: Fit the base model with saturated fixed effects
+
+We will first fit a model with all fixed effects included: temperature, distance from shore, and year.
+
+- Year will be modeled as a factor
+- Temperature and distance from shore will be modeled as linear predictors.
+
+```{r fit_saturated_fixed_effects, cache = TRUE, include = FALSE}
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "candidate_models", "saturated_fixed_effects_year_temp_dist.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "candidate_models", "saturated_fixed_effects_year_temp_dist")))
+
+saturated_fixed_effects_year_temp_dist_Data = list(
+  # number of years
+  "n_t" = length(unique(hake$year)),
+  # "n_t" = max(hake$year - min(hake$year)),
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+    # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, # "t_i" = hake$year - min(hake$year),
+  "t_i" = as.integer(dplyr::dense_rank(hake$year - min(hake$year))-1),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  # "spatial_list" = spatial_list_hake
+)
+
+
+saturated_fixed_effects_year_temp_dist_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_t"=rep(0, max(hake$year - min(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  # "ln_tau_omega"=0, # "ln_tau_epsilon"=0,
+  # "ln_kappa"=0, 
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0))
+  # "epsilon_st_b"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=saturated_fixed_effects_year_temp_dist_Data$n_t)
+  # 
+)
+
+saturated_fixed_effects_year_temp_dist_Obj = MakeADFun( data=saturated_fixed_effects_year_temp_dist_Data,
+                                         parameters=saturated_fixed_effects_year_temp_dist_Params,
+                                         # random= c("omega_s"),
+                                         DLL = "saturated_fixed_effects_year_temp_dist")
+
+# Optimize
+saturated_fixed_effects_year_temp_dist_Opt = nlminb( start=saturated_fixed_effects_year_temp_dist_Obj$par, obj=saturated_fixed_effects_year_temp_dist_Obj$fn, grad=saturated_fixed_effects_year_temp_dist_Obj$gr )
+# add getJointPrecision for index
+# there are no random effects so turn off bias.correct and getJointPrecision
+# saturated_fixed_effects_year_temp_dist_Opt$SD = sdreport( saturated_fixed_effects_year_temp_dist_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+saturated_fixed_effects_year_temp_dist_Opt$SD = sdreport( saturated_fixed_effects_year_temp_dist_Obj, bias.correct=FALSE, getJointPrecision = FALSE )
+saturated_fixed_effects_year_temp_dist_report = saturated_fixed_effects_year_temp_dist_Obj$report()
+
+saturated_fixed_effects_year_temp_dist_output <- list(saturated_fixed_effects_year_temp_dist_Obj = saturated_fixed_effects_year_temp_dist_Obj,
+                                       saturated_fixed_effects_year_temp_dist_Opt = saturated_fixed_effects_year_temp_dist_Opt,
+                                       saturated_fixed_effects_year_temp_dist_report = saturated_fixed_effects_year_temp_dist_report)
+
+save(saturated_fixed_effects_year_temp_dist_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "saturated_fixed_effects_year_temp_dist_output.rda"))
+
+```
+
+## Step 2: Tune the random effects, based on the model with saturated fixed effects
+
+The primary random effects in this model are spatial and spatiotemporal random effects.
+
+The options for the spatial random effects are as follows:
+
+1. No spatial random fields
+2. Spatial random fields (isotropic)
+3. Spatial random fields (anisotropic)
+
+The options for the spatiotemporal random effects are as follows:
+
+1. No spatiotemporal random fields
+2. Spatiotemporal random fields (isotropic, IID)
+3. Spatiotemporal random fields (anisotropic, IID)
+4. Spatiotemporal random fields (isotropic, AR1)
+5. Spatiotemporal random fields (anisotropic, AR1)
+
+However, it doesn't make ecological sense for spatial fields to be anisotropic and spatiotemporal fields to be isotropic, or vice versa (spatial fields isotropic and spatiotemporal fields anisotropic). So, the result of crossing these options with this constraint are the following models:
+
+- 1-1 No spatial random fields, no spatiotemporal random fields
+- 1-2 No spatial random fields, spatiotemporal random fields (isotropic, IID)
+- 1-3 No spatial random fields, spatiotemporal random fields (anisotropic, IID)
+- 1-4 No spatial random fields, spatiotemporal random fields (isotropic, AR1)
+- 1-5 No spatial random fields, spatiotemporal random fields (anisotropic, AR1)
+
+- 2-1 Spatial random fields (isotropic), no spatiotemporal random fields
+- 2-2 Spatial random fields (isotropic), spatiotemporal random fields (isotropic, IID)
+- 2-4 Spatial random fields (isotropic), spatiotemporal random fields (isotropic, AR1)
+
+- 3-1 Spatial random fields (anisotropic), no spatiotemporal random fields
+- 3-3 Spatial random fields (anisotropic), spatiotemporal random fields (anisotropic, IID)
+- 3-5 Spatial random fields (anisotropic), spatiotemporal random fields (anisotropic, AR1)
+
+
+
+The first cross (Model 1-1, no spatial random fields and no spatiotemporal random fields) is the saturated fixed effects model. Therefore, we will proceed with the ten other candidate random effect structures.
+
+### Fit candidate models
+
+#### Model 1-2: No spatial random fields, spatiotemporal random fields (isotropic, IID)
+
+```{r model_1_2, cache = TRUE, include = FALSE}
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_2_spatial_off_spatiotemporal_IID_iso_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_2_spatial_off_spatiotemporal_IID_iso_missing_years")))
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC,
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0, # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0))
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Data$n_t)
+  # 
+)
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj = MakeADFun( data=model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Data,
+                                                             parameters=model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Params,
+                                                             # random= c("omega_s"),
+                                                             random= c("epsilon_st"),
+                                                             DLL = "model1_2_spatial_off_spatiotemporal_IID_iso_missing_years")
+
+# Optimize
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt = nlminb( start=model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj$par, obj=model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj$fn, grad=model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj$gr )
+# add getJointPrecision for index
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt$SD = sdreport( model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report = model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj$report()
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_output <- list(model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj = model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj,
+                                                           model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt = model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt,
+                                                           model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report = model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report)
+
+save(model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_output_binned.rda"))
+
+```
+
+
+```{r}
+hake %>% group_by(year) %>% summarise(total = sum(NASC)) -> hake_year_sums
+actual_years <- (min(hake$year):max(hake$year))[c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11)!= -999]
+hake_SDM_annual_estimates <- data.frame(year = (min(hake$year):max(hake$year)),
+                                        estimate = colSums(exp(model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report$ln_d_gt)))
+
+hake_SDM_annual_estimates %>% 
+  left_join(hake_year_sums, by = "year") %>% 
+  filter(year %in% actual_years) -> hake_SDM_annual_estimates
+
+ggplot(hake_SDM_annual_estimates, aes(x = total, y = estimate, label = year)) +
+  geom_point() +
+  geom_text()
+
+hist(colSums(exp(model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report$ln_d_gt)))
+# This looks pretty reasonable...
+
+
+```
+
+
+#### Model 1-3: No spatial random fields, spatiotemporal random fields (anisotropic, IID)
+
+```{r model_1_3, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years")))
+
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0, # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0))
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Data$n_t)
+  # 
+)
+
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj = MakeADFun( data=model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Data,
+                                                               parameters=model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Params,
+                                                               # random= c("omega_s"),
+                                                               random= c("epsilon_st"),
+                                                               DLL = "model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years")
+
+# Optimize
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Opt = nlminb( start=model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj$par, obj=model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj$fn, grad=model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj$gr )
+# add getJointPrecision for index
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Opt$SD = sdreport( model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_report = model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj$report()
+
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_output <- list(model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj = model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj,
+                                                             model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Opt = model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Opt,
+                                                             model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_report = model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_report)
+
+save(model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_output.rda"))
+```
+
+#### Model 1-4: No spatial random fields, spatiotemporal random fields (isotropic, AR1)
+
+```{r model_1_4, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years")))
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0, # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0))
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Data$n_t)
+  # 
+)
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj = MakeADFun( data=model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Data,
+                                                             parameters=model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Params,
+                                                             # random= c("omega_s"),
+                                                             random= c("epsilon_st"),
+                                                             DLL = "model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years")
+
+# Optimize
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt = nlminb( start=model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj$par, obj=model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj$fn, grad=model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj$gr )
+# add getJointPrecision for index
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt$SD = sdreport( model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_report = model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj$report()
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_output <- list(model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj = model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj,
+                                                           model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt = model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt,
+                                                           model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_report = model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_report)
+
+save(model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_output.rda"))
+```
+
+
+#### Model 1-5: No spatial random fields, spatiotemporal random fields (anisotropic, AR1)
+
+```{r model_1_5, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years")))
+
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0, # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0))
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Data$n_t)
+  # 
+)
+
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj = MakeADFun( data=model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Data,
+                                                               parameters=model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Params,
+                                                               # random= c("omega_s"),
+                                                               random= c("epsilon_st"),
+                                                               DLL = "model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years")
+
+# Optimize
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Opt = nlminb( start=model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj$par, obj=model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj$fn, grad=model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj$gr )
+# add getJointPrecision for index
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Opt$SD = sdreport( model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_report = model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj$report()
+
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_output <- list(model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj = model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj,
+                                                             model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Opt = model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Opt,
+                                                             model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_report = model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_report)
+
+save(model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_output.rda"))
+```
+
+
+
+#### Model 2-1: Spatial random fields (isotropic), no spatiotemporal random fields
+
+
+```{r model_2_1, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_1_spatial_on_spatiotemporal_off_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_1_spatial_on_spatiotemporal_off_missing_years")))
+
+model2_1_spatial_on_spatiotemporal_off_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model2_1_spatial_on_spatiotemporal_off_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  # "ln_tau_epsilon"=0, 
+  "ln_tau_omega"=0,
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  # SDM random effects
+  "omega_s"=rnorm(nrow(hake_survey_spde$c0))
+  # "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model2_1_spatial_on_spatiotemporal_off_missing_years_Data$n_t)
+  # 
+)
+
+model2_1_spatial_on_spatiotemporal_off_missing_years_Obj = MakeADFun( data=model2_1_spatial_on_spatiotemporal_off_missing_years_Data,
+                                                        parameters=model2_1_spatial_on_spatiotemporal_off_missing_years_Params,
+                                                        random= c("omega_s"),
+                                                        # random= c("epsilon_st"),
+                                                        DLL = "model2_1_spatial_on_spatiotemporal_off_missing_years")
+
+# Optimize
+model2_1_spatial_on_spatiotemporal_off_missing_years_Opt = nlminb( start=model2_1_spatial_on_spatiotemporal_off_missing_years_Obj$par, obj=model2_1_spatial_on_spatiotemporal_off_missing_years_Obj$fn, grad=model2_1_spatial_on_spatiotemporal_off_missing_years_Obj$gr )
+# add getJointPrecision for index
+model2_1_spatial_on_spatiotemporal_off_missing_years_Opt$SD = sdreport( model2_1_spatial_on_spatiotemporal_off_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model2_1_spatial_on_spatiotemporal_off_missing_years_report = model2_1_spatial_on_spatiotemporal_off_missing_years_Obj$report()
+
+model2_1_spatial_on_spatiotemporal_off_missing_years_output <- list(model2_1_spatial_on_spatiotemporal_off_missing_years_Obj = model2_1_spatial_on_spatiotemporal_off_missing_years_Obj,
+                                                      model2_1_spatial_on_spatiotemporal_off_missing_years_Opt = model2_1_spatial_on_spatiotemporal_off_missing_years_Opt,
+                                                      model2_1_spatial_on_spatiotemporal_off_missing_years_report = model2_1_spatial_on_spatiotemporal_off_missing_years_report)
+
+save(model2_1_spatial_on_spatiotemporal_off_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model2_1_spatial_on_spatiotemporal_off_missing_years_output.rda"))
+```
+
+
+#### Model 2-2: Spatial random fields (isotropic), spatiotemporal random fields (isotropic, IID)
+
+
+```{r model_2_2, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years")))
+
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  # SDM random effects
+  "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Data$n_t)
+  # 
+)
+
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj = MakeADFun( data=model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Data,
+                                                            parameters=model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Params,
+                                                            random= c("omega_s", "epsilon_st"),
+                                                            DLL = "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years")
+
+# Optimize
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt = nlminb( start=model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj$par, obj=model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj$fn, grad=model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj$gr )
+# add getJointPrecision for index
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt$SD = sdreport( model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_report = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj$report()
+
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_output <- list(model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj,
+                                                          model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt,
+                                                          model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_report = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_report)
+
+save(model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_output.rda"))
+```
+
+
+#### Model 2-4: Spatial random fields (isotropic), spatiotemporal random fields (isotropic, AR1)
+
+```{r model_2_4, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years")))
+
+model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Data$n_t)
+  # 
+)
+
+model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj = MakeADFun( data=model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Data,
+                                                            parameters=model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Params,
+                                                            random= c("omega_s", "epsilon_st"),
+                                                            DLL = "model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years")
+
+# Optimize
+model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Opt = nlminb( start=model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj$par, obj=model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj$fn, grad=model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj$gr )
+# add getJointPrecision for index
+model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Opt$SD = sdreport( model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_report = model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj$report()
+
+model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_output <- list(model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj = model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Obj,
+                                                          model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Opt = model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_Opt,
+                                                          model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_report = model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_report)
+
+save(model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model2_4_spatial_on_spatiotemporal_AR1_iso_missing_years_output.rda"))
+```
+
+#### Model 3-1: Spatial random fields (anisotropic), no spatiotemporal random fields
+
+
+```{r model_3_1, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_1_spatial_aniso_spatiotemporal_off_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_1_spatial_aniso_spatiotemporal_off_missing_years")))
+
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  # "ln_tau_epsilon"=0, 
+  "ln_tau_omega"=0,
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  # SDM random effects
+  "omega_s"=rnorm(nrow(hake_survey_spde$c0))
+  # "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model3_1_spatial_aniso_spatiotemporal_off_missing_years_Data$n_t)
+  # 
+)
+
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj = MakeADFun( data=model3_1_spatial_aniso_spatiotemporal_off_missing_years_Data,
+                                                           parameters=model3_1_spatial_aniso_spatiotemporal_off_missing_years_Params,
+                                                           random= c("omega_s"),
+                                                           # random= c("epsilon_st"),
+                                                           DLL = "model3_1_spatial_aniso_spatiotemporal_off_missing_years")
+
+# Optimize
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_Opt = nlminb( start=model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj$par, obj=model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj$fn, grad=model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj$gr )
+# add getJointPrecision for index
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_Opt$SD = sdreport( model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_report = model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj$report()
+
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_output <- list(model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj = model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj,
+                                                         model3_1_spatial_aniso_spatiotemporal_off_missing_years_Opt = model3_1_spatial_aniso_spatiotemporal_off_missing_years_Opt,
+                                                         model3_1_spatial_aniso_spatiotemporal_off_missing_years_report = model3_1_spatial_aniso_spatiotemporal_off_missing_years_report)
+
+save(model3_1_spatial_aniso_spatiotemporal_off_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model3_1_spatial_aniso_spatiotemporal_off_missing_years_output.rda"))
+```
+
+
+
+
+#### Model 3-3: Spatial random fields (anisotropic), spatiotemporal random fields (anisotropic, IID)
+
+```{r model_3_3, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years")))
+
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  # SDM random effects
+  "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Data$n_t)
+  # 
+)
+
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj = MakeADFun( data=model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Data,
+                                                                 parameters=model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Params,
+                                                                 random= c("omega_s", "epsilon_st"),
+                                                                 DLL = "model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years")
+
+# Optimize
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Opt = nlminb( start=model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj$par, obj=model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj$fn, grad=model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj$gr )
+# add getJointPrecision for index
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Opt$SD = sdreport( model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_report = model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj$report()
+
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_output <- list(model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj = model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj,
+                                                               model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Opt = model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Opt,
+                                                               model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_report = model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_report)
+
+save(model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_output.rda"))
+```
+
+
+
+#### Model 3-5: Spatial random fields (anisotropic), spatiotemporal random fields (anisotropic, AR1)
+
+```{r model_3_5, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1")))
+
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Data = list(
+  # number of years
+  # "n_t" = length(unique(hake$year)),
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, 
+  # "t_i" = as.integer(dplyr::dense_rank(hake$year - min(hake$year))-1),
+  "t_i" = hake$year - min(hake$year),
+  "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11),
+  "A_gs"=A_gs_hake,
+  "A_is"=A_is_hake,
+  "spatial_list" = spatial_list_hake
+)
+
+
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Data$n_t)
+  # 
+)
+
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj = MakeADFun( data=model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Data,
+                                                            parameters=model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Params,
+                                                            random= c("omega_s", "epsilon_st"),
+                                                            DLL = "model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1")
+
+# Optimize
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Opt = nlminb( start=model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj$par, obj=model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj$fn, grad=model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj$gr )
+# add getJointPrecision for index
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Opt$SD = sdreport( model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_report = model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj$report()
+
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_output <- list(model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj = model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj,
+                                                          model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Opt = model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Opt,
+                                                          model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_report = model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_report)
+
+save(model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_output.rda"))
+```
+
+### Compare candidate models
+
+```{r random_effects_model_selection, cache = TRUE, include = FALSE}
+
+# make sure that objects are loaded - need to do this if chunk outputs were cached
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "candidate_models", "saturated_fixed_effects_year_temp_dist")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_2_spatial_off_spatiotemporal_IID_iso_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_1_spatial_on_spatiotemporal_off_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_1_spatial_aniso_spatiotemporal_off_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "missing_years_candidate_models",  "model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1")))
+
+# Calculate cAIC and AIC for each model
+
+### Fixed effects
+saturated_fixed_effects_year_temp_dist_cAIC <- cAIC(model_data = saturated_fixed_effects_year_temp_dist_Data,
+                                                    model_obj = saturated_fixed_effects_year_temp_dist_Obj,  
+                                                    model_parameters = saturated_fixed_effects_year_temp_dist_Params,
+                                                    random = NULL,
+                                                    DLL = "saturated_fixed_effects_year_temp_dist",
+                                                    data_observation_names = "D_i")
+
+saturated_fixed_effects_year_temp_dist_AIC <- 2*saturated_fixed_effects_year_temp_dist_Opt$objective + 2 * length(saturated_fixed_effects_year_temp_dist_Opt$par)
+
+### Model 1-2
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_cAIC <- cAIC(model_data = model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Data,
+                                                         model_obj = model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj,  
+                                                         model_parameters = model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Params,
+                                                         random = "epsilon_st",
+                                                         DLL = "model1_2_spatial_off_spatiotemporal_IID_iso_missing_years",
+                                                         data_observation_names = "D_i")
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_AIC <- 2*model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt$objective + 2 * length(model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt$par)
+
+### Model 1-3
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_cAIC <- cAIC(model_data = model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Data,
+                                                           model_obj = model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Obj,  
+                                                           model_parameters = model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Params,
+                                                           random = "epsilon_st",
+                                                           DLL = "model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years",
+                                                           data_observation_names = "D_i")
+
+model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_AIC <- 2*model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Opt$objective + 2 * length(model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_Opt$par)
+
+### Model 1-4
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_cAIC <- cAIC(model_data = model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Data,
+                                                         model_obj = model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj,  
+                                                         model_parameters = model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Params,
+                                                         random = "epsilon_st",
+                                                         DLL = "model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years",
+                                                         data_observation_names = "D_i")
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_AIC <- 2*model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt$objective + 2 * length(model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt$par)
+
+### Model 1-5
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_cAIC <- cAIC(model_data = model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Data,
+                                                           model_obj = model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Obj,  
+                                                           model_parameters = model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Params,
+                                                           random = "epsilon_st",
+                                                           DLL = "model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years",
+                                                           data_observation_names = "D_i")
+
+model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_AIC <- 2*model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Opt$objective + 2 * length(model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_Opt$par)
+
+# checkpoint!!
+# save.image("hake_model_selection.RData")
+
+### Model 2-1
+model2_1_spatial_on_spatiotemporal_off_missing_years_cAIC <- cAIC(model_data = model2_1_spatial_on_spatiotemporal_off_missing_years_Data,
+                                                    model_obj = model2_1_spatial_on_spatiotemporal_off_missing_years_Obj,  
+                                                    model_parameters = model2_1_spatial_on_spatiotemporal_off_missing_years_Params,
+                                                    random = "omega_s",
+                                                    DLL = "model2_1_spatial_on_spatiotemporal_off_missing_years",
+                                                    data_observation_names = "D_i")
+
+model2_1_spatial_on_spatiotemporal_off_missing_years_AIC <- 2*model2_1_spatial_on_spatiotemporal_off_missing_years_Opt$objective + 2 * length(model2_1_spatial_on_spatiotemporal_off_missing_years_Opt$par)
+
+### Model 2-2
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_cAIC <- cAIC(model_data = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Data,
+                                                        model_obj = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj,  
+                                                        model_parameters = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Params,
+                                                        random = "omega_s",
+                                                        DLL = "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years",
+                                                        data_observation_names = "D_i")
+
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_AIC <- 2*model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt$objective + 2 * length(model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt$par)
+
+### Model 2-4
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_cAIC <- cAIC(model_data = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Data,
+                                                        model_obj = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Obj,  
+                                                        model_parameters = model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Params,
+                                                        random = "omega_s",
+                                                        DLL = "model2_2_spatial_on_spatiotemporal_IID_iso_missing_years",
+                                                        data_observation_names = "D_i")
+
+model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_AIC <- 2*model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt$objective + 2 * length(model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_Opt$par)
+
+### Model 3-1
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_cAIC <- cAIC(model_data = model3_1_spatial_aniso_spatiotemporal_off_missing_years_Data,
+                                                       model_obj = model3_1_spatial_aniso_spatiotemporal_off_missing_years_Obj,  
+                                                       model_parameters = model3_1_spatial_aniso_spatiotemporal_off_missing_years_Params,
+                                                       random = c("omega_s"),
+                                                       DLL = "model3_1_spatial_aniso_spatiotemporal_off_missing_years",
+                                                       data_observation_names = "D_i")
+
+model3_1_spatial_aniso_spatiotemporal_off_missing_years_AIC <- 2*model3_1_spatial_aniso_spatiotemporal_off_missing_years_Opt$objective + 2 * length(model3_1_spatial_aniso_spatiotemporal_off_missing_years_Opt$par)
+
+### Model 3-3
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_cAIC <- cAIC(model_data = model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Data,
+                                                             model_obj = model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Obj,  
+                                                             model_parameters = model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Params,
+                                                             random = c("omega_s", "epsilon_st"),
+                                                             DLL = "model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years",
+                                                             data_observation_names = "D_i")
+
+model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_AIC <- 2*model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Opt$objective + 2 * length(model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_Opt$par)
+
+### Model 3-5
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_cAIC <- cAIC(model_data = model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Data,
+                                                             model_obj = model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Obj,  
+                                                             model_parameters = model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Params,
+                                                             random = c("omega_s", "epsilon_st"),
+                                                             DLL = "model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1",
+                                                             data_observation_names = "D_i")
+
+model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_AIC <- 2*model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Opt$objective + 2 * length(model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_Opt$par)
+
+# summarize this all in a table
+random_effects_model_comparison_table <- data.frame(model = c("Spatial OFF + Spatiotemporal OFF",
+                                                              "Spatial OFF + Spatiotemporal IID (isotropic)",
+                                                              "Spatial OFF + Spatiotemporal IID (anisotropic)",
+                                                              "Spatial OFF + Spatiotemporal AR1 (isotropic)",
+                                                              "Spatial OFF + Spatiotemporal AR1 (anisotropic)",
+                                                              "Spatial ON + Spatiotemporal OFF (isotropic)",
+                                                              "Spatial ON + Spatiotemporal IID (isotropic)",
+                                                              "Spatial ON + Spatiotemporal AR1 (isotropic)",
+                                                              "Spatial ON + Spatiotemporal OFF (anisotropic)", 
+                                                              "Spatial ON + Spatiotemporal IID (anisotropic)", 
+                                                              "Spatial ON + Spatiotemporal AR1 (anisotropic)"),
+                                                    AIC = c(saturated_fixed_effects_year_temp_dist_AIC,
+                                                            model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_AIC,
+                                                            model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_AIC,
+                                                            model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_AIC,
+                                                            model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_AIC,
+                                                            model2_1_spatial_on_spatiotemporal_off_missing_years_AIC,
+                                                            model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_AIC,
+                                                            model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_AIC,
+                                                            model3_1_spatial_aniso_spatiotemporal_off_missing_years_AIC,
+                                                            model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_AIC,
+                                                            model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_AIC),
+                                                    cAIC = c(NA,
+                                                             model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_cAIC,
+                                                             model1_3_spatial_off_spatiotemporal_IID_aniso_missing_years_cAIC,
+                                                             model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_cAIC,
+                                                             model1_5_spatial_off_spatiotemporal_AR1_aniso_missing_years_cAIC,
+                                                             model2_1_spatial_on_spatiotemporal_off_missing_years_cAIC,
+                                                             model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_cAIC,
+                                                             model2_2_spatial_on_spatiotemporal_IID_iso_missing_years_cAIC,
+                                                             model3_1_spatial_aniso_spatiotemporal_off_missing_years_cAIC,
+                                                             model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_cAIC,
+                                                             model3_5_spatial_aniso_spatiotemporal_AR1_aniso_missing_years_1_cAIC))
+
+# checkpoint!!
+save.image("hake_model_selection.RData")
+
+```
+
+```{r random_effects_model_comparison_table}
+
+random_effects_model_comparison_table %>% 
+  arrange(cAIC) %>% 
+  mutate(AIC = round(AIC, 2)) %>% 
+  mutate(cAIC = round(cAIC, 2)) %>% 
+  kbl(caption = "AIC and cAIC scores for the random effect structures.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+```
+
+
+Sanity check some of our model outputs
+```{r}
+### Best fit model
+load(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_output.rda"))
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj <- model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_output$model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Obj
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt <- model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_output$model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_Opt
+
+model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report <- model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_output$model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report
+
+
+hake %>% group_by(year) %>% summarise(total = sum(NASC)) -> hake_year_sums
+actual_years <- (min(hake$year):max(hake$year))[c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11)!= -999]
+hake_SDM_annual_estimates <- data.frame(year = (min(hake$year):max(hake$year)),
+                                        estimate = colSums(exp(model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report$ln_d_gt)))
+
+hake_SDM_annual_estimates %>% 
+  left_join(hake_year_sums, by = "year") %>% 
+  filter(year %in% actual_years) -> hake_SDM_annual_estimates
+
+ggplot(hake_SDM_annual_estimates, aes(x = total, y = estimate, label = year)) +
+  geom_point() +
+  geom_text()
+
+hist(colSums(exp(model1_2_spatial_off_spatiotemporal_IID_iso_missing_years_report$ln_d_gt)))
+# This is giving completely unreasonable estimates. Even though the cAIC and AIC scores are so much better! What the heck
+
+
+
+
+
+### second best fit model
+load(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_output.rda"))
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj <- model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_output$model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Obj
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt <- model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_output$model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_Opt
+
+model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_report <- model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_output$model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_report
+
+
+hake %>% group_by(year) %>% summarise(total = sum(NASC)) -> hake_year_sums
+actual_years <- (min(hake$year):max(hake$year))[c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11)!= -999]
+hake_SDM_annual_estimates <- data.frame(year = (min(hake$year):max(hake$year)),
+                                        estimate = colSums(exp(model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_report$ln_d_gt)))
+
+hake_SDM_annual_estimates %>% 
+  left_join(hake_year_sums, by = "year") %>% 
+  filter(year %in% actual_years) -> hake_SDM_annual_estimates
+
+ggplot(hake_SDM_annual_estimates, aes(x = total, y = estimate, label = year)) +
+  geom_point() +
+  geom_text()
+
+hist(colSums(exp(model1_4_spatial_off_spatiotemporal_AR1_iso_missing_years_report$ln_d_gt)))
+# This looks much more reasonable.
+```
+
+## Step 3: Tune fixed effects based on random effects selected in step 2
+
+We have three covariates that we are exploring:
+
+- Year
+- Temperature
+- Distance from shore
+
+Year we will only model as a factor representing a year-wide intercept for the full survey region, without an autoregressive component. This is because we do not expect the abundance of salmon to be an autoregressive process (successive run years are not related in terms of abundance, given the salmon life history).
+
+Temperature we can model as a linear fixed effect or a smooth spline (technically a random effect).
+
+Distance from shore we can model as a linear fixed effect or a smooth spline (technically a random effect).
+
+Therefore, our options for fixed effects are as follows:
+
+- Year, as a factor (on/off)
+- Temperature (off/linear/spline)
+- Distance from shore (off/linear/spline)
+
+
+Crossing these options (2 x 3 x 3) results in the following 18 candidate fixed effect structures:
+
+1. Year (factor) + temperature (linear) + distance from shore (linear) - this is the base model that we used to test random effect structures.
+2. Year (factor) + temperature (smooth spline) + distance from shore (smooth spline)
+3. Year (factor) + temperature (linear) + distance from shore (smooth spline)
+4. Year (factor) + temperature (smooth spline) + distance from shore (linear)
+5. Year (factor) + temperature (linear)
+6. Year (factor) + distance from shore (linear)
+7. Year (factor) + temperature (smooth spline)
+8. Year (factor) + distance from shore (smooth spline)
+9. Year (factor)
+10. Distance from shore (smooth spline) + temperature (smooth spline)
+11. Distance from shore (smooth spline) + temperature (linear)
+12. Distance from shore (linear) + temperature (smooth spline)
+13. Distance from shore (linear) + temperature (linear)
+14. Distance from shore (smooth spline)
+15. Distance from shore (linear)
+16. Temperature (smooth spline)
+17. Temperature (linear)
+18. No fixed effects
+
+
+### Fit candidate models
+
+#### Model 2: Year (factor) + temperature (smooth spline) + distance from shore (smooth spline)
+
+```{r model_2, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(SST_scaled) + s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears),
+                             dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(SST_scaled) + s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL,
+      newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_stemp_sdist_year_v1.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_sdist_year_v1")))
+
+hake_bestfitRE_stemp_sdist_year_v1_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake,  
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+    # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_stemp_sdist_year_v1_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_stemp_sdist_year_v1_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_stemp_sdist_year_v1_Obj = MakeADFun( data=hake_bestfitRE_stemp_sdist_year_v1_Data,
+                                                            parameters=hake_bestfitRE_stemp_sdist_year_v1_Params,
+                                                            random= c("epsilon_st", "b_smooth"),
+                                                            DLL = "hake_bestfitRE_stemp_sdist_year_v1")
+
+# Optimize
+hake_bestfitRE_stemp_sdist_year_v1_Opt = nlminb( start=hake_bestfitRE_stemp_sdist_year_v1_Obj$par, obj=hake_bestfitRE_stemp_sdist_year_v1_Obj$fn, grad=hake_bestfitRE_stemp_sdist_year_v1_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_stemp_sdist_year_v1_Opt$SD = sdreport( hake_bestfitRE_stemp_sdist_year_v1_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_stemp_sdist_year_v1_report = hake_bestfitRE_stemp_sdist_year_v1_Obj$report()
+
+hake_bestfitRE_stemp_sdist_year_v1_output <- list(hake_bestfitRE_stemp_sdist_year_v1_Obj = hake_bestfitRE_stemp_sdist_year_v1_Obj,
+                                                          hake_bestfitRE_stemp_sdist_year_v1_Opt = hake_bestfitRE_stemp_sdist_year_v1_Opt,
+                                                          hake_bestfitRE_stemp_sdist_year_v1_report = hake_bestfitRE_stemp_sdist_year_v1_report)
+
+save(hake_bestfitRE_stemp_sdist_year_v1_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_sdist_year_v1_output.rda"))
+```
+
+#### Model 3: Year (factor) + temperature (linear)
+
+```{r model_3, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_year.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_year")))
+
+hake_bestfitRE_temp_year_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  # "dist_i" = hake$dist_shore_scaled,
+  # "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+hake_bestfitRE_temp_year_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_temp_year_Data$n_t)
+  # 
+)
+
+hake_bestfitRE_temp_year_Obj = MakeADFun( data=hake_bestfitRE_temp_year_Data,
+                                                                 parameters=hake_bestfitRE_temp_year_Params,
+                                                                 random= c("epsilon_st"),
+                                                                 DLL = "hake_bestfitRE_temp_year")
+
+# Optimize
+hake_bestfitRE_temp_year_Opt = nlminb( start=hake_bestfitRE_temp_year_Obj$par, obj=hake_bestfitRE_temp_year_Obj$fn, grad=hake_bestfitRE_temp_year_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_temp_year_Opt$SD = sdreport( hake_bestfitRE_temp_year_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_temp_year_report = hake_bestfitRE_temp_year_Obj$report()
+
+hake_bestfitRE_temp_year_output <- list(hake_bestfitRE_temp_year_Obj = hake_bestfitRE_temp_year_Obj,
+                                                               hake_bestfitRE_temp_year_Opt = hake_bestfitRE_temp_year_Opt,
+                                                               hake_bestfitRE_temp_year_report = hake_bestfitRE_temp_year_report)
+
+save(hake_bestfitRE_temp_year_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "hake_bestfitRE_temp_year_output.rda"))
+```
+
+#### Model 4: Year (factor) + distance from shore (linear)
+
+```{r model_4, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_dist_year.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_dist_year")))
+
+hake_bestfitRE_dist_year_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  # "temp_i" = hake$SST_scaled,
+  # "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+hake_bestfitRE_dist_year_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_dist_year_Data$n_t)
+  # 
+)
+
+hake_bestfitRE_dist_year_Obj = MakeADFun( data=hake_bestfitRE_dist_year_Data,
+                                           parameters=hake_bestfitRE_dist_year_Params,
+                                           random= c("epsilon_st"),
+                                           DLL = "hake_bestfitRE_dist_year")
+
+# Optimize
+hake_bestfitRE_dist_year_Opt = nlminb( start=hake_bestfitRE_dist_year_Obj$par, obj=hake_bestfitRE_dist_year_Obj$fn, grad=hake_bestfitRE_dist_year_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_dist_year_Opt$SD = sdreport( hake_bestfitRE_dist_year_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_dist_year_report = hake_bestfitRE_dist_year_Obj$report()
+
+hake_bestfitRE_dist_year_output <- list(hake_bestfitRE_dist_year_Obj = hake_bestfitRE_dist_year_Obj,
+                                         hake_bestfitRE_dist_year_Opt = hake_bestfitRE_dist_year_Opt,
+                                         hake_bestfitRE_dist_year_report = hake_bestfitRE_dist_year_report)
+
+save(hake_bestfitRE_dist_year_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "hake_bestfitRE_dist_year_output.rda"))
+```
+
+#### Model 5: Year (factor) + temperature (smooth spline)
+
+```{r model_5, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_stemp_year.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_year")))
+
+hake_bestfitRE_stemp_year_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  # "dist_i" = hake$dist_shore_scaled,
+  # "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_stemp_year_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_stemp_year_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_stemp_year_Obj = MakeADFun( data=hake_bestfitRE_stemp_year_Data,
+                                                  parameters=hake_bestfitRE_stemp_year_Params,
+                                                  random= c("epsilon_st", "b_smooth"),
+                                                  DLL = "hake_bestfitRE_stemp_year")
+
+# Optimize
+hake_bestfitRE_stemp_year_Opt = nlminb( start=hake_bestfitRE_stemp_year_Obj$par, obj=hake_bestfitRE_stemp_year_Obj$fn, grad=hake_bestfitRE_stemp_year_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_stemp_year_Opt$SD = sdreport( hake_bestfitRE_stemp_year_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_stemp_year_report = hake_bestfitRE_stemp_year_Obj$report()
+
+hake_bestfitRE_stemp_year_output <- list(hake_bestfitRE_stemp_year_Obj = hake_bestfitRE_stemp_year_Obj,
+                                                hake_bestfitRE_stemp_year_Opt = hake_bestfitRE_stemp_year_Opt,
+                                                hake_bestfitRE_stemp_year_report = hake_bestfitRE_stemp_year_report)
+
+save(hake_bestfitRE_stemp_year_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_year_output.rda"))
+```
+
+#### Model 6: Year (factor) + s(dist)
+
+```{r model_6, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(
+  dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_sdist_year.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_sdist_year")))
+
+hake_bestfitRE_sdist_year_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  # "temp_i" = hake$SST_scaled,
+  # "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_sdist_year_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_sdist_year_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_sdist_year_Obj = MakeADFun( data=hake_bestfitRE_sdist_year_Data,
+                                                  parameters=hake_bestfitRE_sdist_year_Params,
+                                                  random= c("epsilon_st", "b_smooth"),
+                                                  DLL = "hake_bestfitRE_sdist_year")
+
+# Optimize
+hake_bestfitRE_sdist_year_Opt = nlminb( start=hake_bestfitRE_sdist_year_Obj$par, obj=hake_bestfitRE_sdist_year_Obj$fn, grad=hake_bestfitRE_sdist_year_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_sdist_year_Opt$SD = sdreport( hake_bestfitRE_sdist_year_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_sdist_year_report = hake_bestfitRE_sdist_year_Obj$report()
+
+hake_bestfitRE_sdist_year_output <- list(hake_bestfitRE_sdist_year_Obj = hake_bestfitRE_sdist_year_Obj,
+                                                hake_bestfitRE_sdist_year_Opt = hake_bestfitRE_sdist_year_Opt,
+                                                hake_bestfitRE_sdist_year_report = hake_bestfitRE_sdist_year_report)
+
+save(hake_bestfitRE_sdist_year_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_sdist_year_output.rda"))
+```
+
+#### Model 7: Year (factor)
+
+```{r model_7, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_year1.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_year1")))
+
+hake_bestfitRE_year1_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  # "temp_i" = hake$SST_scaled,
+  # "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  # "dist_i" = hake$dist_shore_scaled,
+  # "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+hake_bestfitRE_year1_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_year1_Data$n_t)
+  # 
+)
+
+hake_bestfitRE_year1_Obj = MakeADFun( data=hake_bestfitRE_year1_Data,
+                                           parameters=hake_bestfitRE_year1_Params,
+                                           random= c("epsilon_st"),
+                                           DLL = "hake_bestfitRE_year1")
+
+# Optimize
+hake_bestfitRE_year1_Opt = nlminb( start=hake_bestfitRE_year1_Obj$par, obj=hake_bestfitRE_year1_Obj$fn, grad=hake_bestfitRE_year1_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_year1_Opt$SD = sdreport( hake_bestfitRE_year1_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_year1_report = hake_bestfitRE_year1_Obj$report()
+
+hake_bestfitRE_year1_output <- list(hake_bestfitRE_year1_Obj = hake_bestfitRE_year1_Obj,
+                                         hake_bestfitRE_year1_Opt = hake_bestfitRE_year1_Opt,
+                                         hake_bestfitRE_year1_report = hake_bestfitRE_year1_report)
+
+save(hake_bestfitRE_year1_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "hake_bestfitRE_year1_output.rda"))
+```
+
+#### Model 8: No fixed effects
+
+```{r model_8, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_noFE.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_noFE")))
+
+hake_bestfitRE_noFE_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  # "temp_i" = hake$SST_scaled,
+  # "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  # "dist_i" = hake$dist_shore_scaled,
+  # "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+hake_bestfitRE_noFE_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_noFE_Data$n_t)
+  # 
+)
+
+hake_bestfitRE_noFE_Obj = MakeADFun( data=hake_bestfitRE_noFE_Data,
+                                           parameters=hake_bestfitRE_noFE_Params,
+                                           random= c("epsilon_st"),
+                                           DLL = "hake_bestfitRE_noFE")
+
+# Optimize
+hake_bestfitRE_noFE_Opt = nlminb( start=hake_bestfitRE_noFE_Obj$par, obj=hake_bestfitRE_noFE_Obj$fn, grad=hake_bestfitRE_noFE_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_noFE_Opt$SD = sdreport( hake_bestfitRE_noFE_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_noFE_report = hake_bestfitRE_noFE_Obj$report()
+
+hake_bestfitRE_noFE_output <- list(hake_bestfitRE_noFE_Obj = hake_bestfitRE_noFE_Obj,
+                                         hake_bestfitRE_noFE_Opt = hake_bestfitRE_noFE_Opt,
+                                         hake_bestfitRE_noFE_report = hake_bestfitRE_noFE_report)
+
+save(hake_bestfitRE_noFE_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "hake_bestfitRE_noFE_output.rda"))
+```
+
+
+
+#### Model 9: temperature (smooth spline) + distance from shore (smooth spline)
+
+```{r model_9, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(SST_scaled) + s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears),
+                           dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(SST_scaled) + s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_stemp_sdist.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_sdist")))
+
+hake_bestfitRE_stemp_sdist_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_stemp_sdist_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_stemp_sdist_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_stemp_sdist_Obj = MakeADFun( data=hake_bestfitRE_stemp_sdist_Data,
+                                                  parameters=hake_bestfitRE_stemp_sdist_Params,
+                                                  random= c("epsilon_st", "b_smooth"),
+                                                  DLL = "hake_bestfitRE_stemp_sdist")
+
+# Optimize
+hake_bestfitRE_stemp_sdist_Opt = nlminb( start=hake_bestfitRE_stemp_sdist_Obj$par, obj=hake_bestfitRE_stemp_sdist_Obj$fn, grad=hake_bestfitRE_stemp_sdist_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_stemp_sdist_Opt$SD = sdreport( hake_bestfitRE_stemp_sdist_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_stemp_sdist_report = hake_bestfitRE_stemp_sdist_Obj$report()
+
+hake_bestfitRE_stemp_sdist_output <- list(hake_bestfitRE_stemp_sdist_Obj = hake_bestfitRE_stemp_sdist_Obj,
+                                                hake_bestfitRE_stemp_sdist_Opt = hake_bestfitRE_stemp_sdist_Opt,
+                                                hake_bestfitRE_stemp_sdist_report = hake_bestfitRE_stemp_sdist_report)
+
+save(hake_bestfitRE_stemp_sdist_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_sdist_output.rda"))
+```
+
+#### Model 10: temperature (linear)
+
+```{r model_10, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp")))
+
+hake_bestfitRE_temp_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  # "dist_i" = hake$dist_shore_scaled,
+  # "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+hake_bestfitRE_temp_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_temp_Data$n_t)
+  # 
+)
+
+hake_bestfitRE_temp_Obj = MakeADFun( data=hake_bestfitRE_temp_Data,
+                                           parameters=hake_bestfitRE_temp_Params,
+                                           random= c("epsilon_st"),
+                                           DLL = "hake_bestfitRE_temp")
+
+# Optimize
+hake_bestfitRE_temp_Opt = nlminb( start=hake_bestfitRE_temp_Obj$par, obj=hake_bestfitRE_temp_Obj$fn, grad=hake_bestfitRE_temp_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_temp_Opt$SD = sdreport( hake_bestfitRE_temp_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_temp_report = hake_bestfitRE_temp_Obj$report()
+
+hake_bestfitRE_temp_output <- list(hake_bestfitRE_temp_Obj = hake_bestfitRE_temp_Obj,
+                                         hake_bestfitRE_temp_Opt = hake_bestfitRE_temp_Opt,
+                                         hake_bestfitRE_temp_report = hake_bestfitRE_temp_report)
+
+save(hake_bestfitRE_temp_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "hake_bestfitRE_temp_output.rda"))
+```
+
+#### Model 11: distance from shore (linear)
+
+```{r model_11, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_dist.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_dist")))
+
+hake_bestfitRE_dist_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  # "temp_i" = hake$SST_scaled,
+  # "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+hake_bestfitRE_dist_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_dist_Data$n_t)
+  # 
+)
+
+hake_bestfitRE_dist_Obj = MakeADFun( data=hake_bestfitRE_dist_Data,
+                                           parameters=hake_bestfitRE_dist_Params,
+                                           random= c("epsilon_st"),
+                                           DLL = "hake_bestfitRE_dist")
+
+# Optimize
+hake_bestfitRE_dist_Opt = nlminb( start=hake_bestfitRE_dist_Obj$par, obj=hake_bestfitRE_dist_Obj$fn, grad=hake_bestfitRE_dist_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_dist_Opt$SD = sdreport( hake_bestfitRE_dist_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_dist_report = hake_bestfitRE_dist_Obj$report()
+
+hake_bestfitRE_dist_output <- list(hake_bestfitRE_dist_Obj = hake_bestfitRE_dist_Obj,
+                                         hake_bestfitRE_dist_Opt = hake_bestfitRE_dist_Opt,
+                                         hake_bestfitRE_dist_report = hake_bestfitRE_dist_report)
+
+save(hake_bestfitRE_dist_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "hake_bestfitRE_dist_output.rda"))
+```
+
+#### Model 12: temperature (smooth spline)
+
+```{r model_12, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_stemp.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp")))
+
+hake_bestfitRE_stemp_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  # "dist_i" = hake$dist_shore_scaled,
+  # "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_stemp_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_stemp_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_stemp_Obj = MakeADFun( data=hake_bestfitRE_stemp_Data,
+                                            parameters=hake_bestfitRE_stemp_Params,
+                                            random= c("epsilon_st", "b_smooth"),
+                                            DLL = "hake_bestfitRE_stemp")
+
+# Optimize
+hake_bestfitRE_stemp_Opt = nlminb( start=hake_bestfitRE_stemp_Obj$par, obj=hake_bestfitRE_stemp_Obj$fn, grad=hake_bestfitRE_stemp_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_stemp_Opt$SD = sdreport( hake_bestfitRE_stemp_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_stemp_report = hake_bestfitRE_stemp_Obj$report()
+
+hake_bestfitRE_stemp_output <- list(hake_bestfitRE_stemp_Obj = hake_bestfitRE_stemp_Obj,
+                                          hake_bestfitRE_stemp_Opt = hake_bestfitRE_stemp_Opt,
+                                          hake_bestfitRE_stemp_report = hake_bestfitRE_stemp_report)
+
+save(hake_bestfitRE_stemp_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_output.rda"))
+```
+
+#### Model 13: s(dist)
+
+```{r model_13, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(
+  dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_sdist.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_sdist")))
+
+hake_bestfitRE_sdist_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  # "temp_i" = hake$SST_scaled,
+  # "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_sdist_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_sdist_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_sdist_Obj = MakeADFun( data=hake_bestfitRE_sdist_Data,
+                                            parameters=hake_bestfitRE_sdist_Params,
+                                            random= c("epsilon_st", "b_smooth"),
+                                            DLL = "hake_bestfitRE_sdist")
+
+# Optimize
+hake_bestfitRE_sdist_Opt = nlminb( start=hake_bestfitRE_sdist_Obj$par, obj=hake_bestfitRE_sdist_Obj$fn, grad=hake_bestfitRE_sdist_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_sdist_Opt$SD = sdreport( hake_bestfitRE_sdist_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_sdist_report = hake_bestfitRE_sdist_Obj$report()
+
+hake_bestfitRE_sdist_output <- list(hake_bestfitRE_sdist_Obj = hake_bestfitRE_sdist_Obj,
+                                          hake_bestfitRE_sdist_Opt = hake_bestfitRE_sdist_Opt,
+                                          hake_bestfitRE_sdist_report = hake_bestfitRE_sdist_report)
+
+save(hake_bestfitRE_sdist_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_sdist_output.rda"))
+```
+
+#### Model 14: temperature (linear) + distance from shore (linear)
+
+```{r model_14, cache = TRUE, include = FALSE}
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_dist.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_dist")))
+
+hake_bestfitRE_temp_dist_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake
+)
+
+
+hake_bestfitRE_temp_dist_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_temp_dist_Data$n_t)
+  # 
+)
+
+hake_bestfitRE_temp_dist_Obj = MakeADFun( data=hake_bestfitRE_temp_dist_Data,
+                                                            parameters=hake_bestfitRE_temp_dist_Params,
+                                                            random= c("epsilon_st"),
+                                                            DLL = "hake_bestfitRE_temp_dist")
+
+# Optimize
+hake_bestfitRE_temp_dist_Opt = nlminb( start=hake_bestfitRE_temp_dist_Obj$par, obj=hake_bestfitRE_temp_dist_Obj$fn, grad=hake_bestfitRE_temp_dist_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_temp_dist_Opt$SD = sdreport( hake_bestfitRE_temp_dist_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_temp_dist_report = hake_bestfitRE_temp_dist_Obj$report()
+
+hake_bestfitRE_temp_dist_output <- list(hake_bestfitRE_temp_dist_Obj = hake_bestfitRE_temp_dist_Obj,
+                                                          hake_bestfitRE_temp_dist_Opt = hake_bestfitRE_temp_dist_Opt,
+                                                          hake_bestfitRE_temp_dist_report = hake_bestfitRE_temp_dist_report)
+
+save(hake_bestfitRE_temp_dist_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_candidate_models", "hake_bestfitRE_temp_dist_output.rda"))
+```
+
+
+#### Model 15: Year (factor) + temperature (smooth spline) + distance from shore (linear)
+
+```{r model_15, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears),
+                           dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_stemp_dist_year.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_dist_year")))
+
+hake_bestfitRE_stemp_dist_year_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_stemp_dist_year_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_stemp_dist_year_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_stemp_dist_year_Obj = MakeADFun( data=hake_bestfitRE_stemp_dist_year_Data,
+                                                  parameters=hake_bestfitRE_stemp_dist_year_Params,
+                                                  random= c("epsilon_st", "b_smooth"),
+                                                  DLL = "hake_bestfitRE_stemp_dist_year")
+
+# Optimize
+hake_bestfitRE_stemp_dist_year_Opt = nlminb( start=hake_bestfitRE_stemp_dist_year_Obj$par, obj=hake_bestfitRE_stemp_dist_year_Obj$fn, grad=hake_bestfitRE_stemp_dist_year_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_stemp_dist_year_Opt$SD = sdreport( hake_bestfitRE_stemp_dist_year_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_stemp_dist_year_report = hake_bestfitRE_stemp_dist_year_Obj$report()
+
+hake_bestfitRE_stemp_dist_year_output <- list(hake_bestfitRE_stemp_dist_year_Obj = hake_bestfitRE_stemp_dist_year_Obj,
+                                                hake_bestfitRE_stemp_dist_year_Opt = hake_bestfitRE_stemp_dist_year_Opt,
+                                                hake_bestfitRE_stemp_dist_year_report = hake_bestfitRE_stemp_dist_year_report)
+
+save(hake_bestfitRE_stemp_dist_year_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_dist_year_output.rda"))
+```
+
+#### Model 16: Year (factor) + temperature (linear) + distance from shore (smooth spline)
+
+```{r model_16, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears),
+                           dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_temp_sdist_year.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_sdist_year")))
+
+hake_bestfitRE_temp_sdist_year_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_temp_sdist_year_Params <- list(
+  
+  ## SDM parameters
+  "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_temp_sdist_year_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_temp_sdist_year_Obj = MakeADFun( data=hake_bestfitRE_temp_sdist_year_Data,
+                                                 parameters=hake_bestfitRE_temp_sdist_year_Params,
+                                                 random= c("epsilon_st", "b_smooth"),
+                                                 DLL = "hake_bestfitRE_temp_sdist_year")
+
+# Optimize
+hake_bestfitRE_temp_sdist_year_Opt = nlminb( start=hake_bestfitRE_temp_sdist_year_Obj$par, obj=hake_bestfitRE_temp_sdist_year_Obj$fn, grad=hake_bestfitRE_temp_sdist_year_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_temp_sdist_year_Opt$SD = sdreport( hake_bestfitRE_temp_sdist_year_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_temp_sdist_year_report = hake_bestfitRE_temp_sdist_year_Obj$report()
+
+hake_bestfitRE_temp_sdist_year_output <- list(hake_bestfitRE_temp_sdist_year_Obj = hake_bestfitRE_temp_sdist_year_Obj,
+                                               hake_bestfitRE_temp_sdist_year_Opt = hake_bestfitRE_temp_sdist_year_Opt,
+                                               hake_bestfitRE_temp_sdist_year_report = hake_bestfitRE_temp_sdist_year_report)
+
+save(hake_bestfitRE_temp_sdist_year_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_sdist_year_output.rda"))
+```
+
+#### Model 17: temperature (smooth spline) + distance from shore (linear)
+
+```{r model_17, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears),
+                           dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(SST_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_stemp_dist.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_dist")))
+
+hake_bestfitRE_stemp_dist_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_stemp_dist_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  # "beta_temp" = 0,
+  "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_stemp_dist_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_stemp_dist_Obj = MakeADFun( data=hake_bestfitRE_stemp_dist_Data,
+                                             parameters=hake_bestfitRE_stemp_dist_Params,
+                                             random= c("epsilon_st", "b_smooth"),
+                                             DLL = "hake_bestfitRE_stemp_dist")
+
+# Optimize
+hake_bestfitRE_stemp_dist_Opt = nlminb( start=hake_bestfitRE_stemp_dist_Obj$par, obj=hake_bestfitRE_stemp_dist_Obj$fn, grad=hake_bestfitRE_stemp_dist_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_stemp_dist_Opt$SD = sdreport( hake_bestfitRE_stemp_dist_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_stemp_dist_report = hake_bestfitRE_stemp_dist_Obj$report()
+
+hake_bestfitRE_stemp_dist_output <- list(hake_bestfitRE_stemp_dist_Obj = hake_bestfitRE_stemp_dist_Obj,
+                                           hake_bestfitRE_stemp_dist_Opt = hake_bestfitRE_stemp_dist_Opt,
+                                           hake_bestfitRE_stemp_dist_report = hake_bestfitRE_stemp_dist_report)
+
+save(hake_bestfitRE_stemp_dist_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_dist_output.rda"))
+```
+
+#### Model 18: temperature (linear) + distance from shore (smooth spline)
+
+```{r model_18, cache = TRUE, include = FALSE}
+
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid <- data.frame(SST_scaled = as.vector(temperature_projection_matrix_hake_allyears),
+                           dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix_hake_allyears)))
+
+sm_predict <- parse_smoothers(formula = "NASC ~ s(dist_shore_scaled)", data = as.data.frame(hake), knots = NULL,
+                              newdata = predict_grid, basis_prev = sm$basis_out)
+
+
+# save.image("hake_model_selection.RData")
+# load("hake_model_selection.RData")
+
+compile(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models",  "hake_bestfitRE_temp_sdist.cpp"))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_sdist")))
+
+hake_bestfitRE_temp_sdist_Data = list(
+  # number of years
+  "n_t" = max(hake$year - min(hake$year))+1,
+  # weights (all 1)
+  "weights_i" = rep(1, length(hake$NASC)),
+  # temperature data
+  "temp_i" = hake$SST_scaled,
+  "temp_gt" = temperature_projection_matrix_hake_allyears,
+  # distance data
+  "dist_i" = hake$dist_shore_scaled,
+  "dist_g" = distance_projection_vector,
+  
+  # hake data
+  "D_i"= hake$NASC, "t_i" = hake$year - min(hake$year),
+   "year_factor_t_i" = c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11), "A_gs"=A_gs_hake, 
+  "A_is"=A_is_hake,
+  # "M0_b"=hake_survey_spde$c0, "M1_b"=hake_survey_spde$g1, "M2_b"=hake_survey_spde$g2,
+  "spatial_list" = spatial_list_hake,
+  
+  # smooth function data
+  "Zs" = sm$Zs, # smoother basis function matrices
+  "Xs" = sm$Xs, # smoother linear effect matrix
+  "b_smooth_start" = sm$b_smooth_start,
+  proj_Zs = sm_predict$Zs,
+  proj_Xs = sm_predict$Xs
+)
+
+hake_bestfitRE_temp_sdist_Params <- list(
+  
+  ## SDM parameters
+  # "beta_t"=rep(0, length(unique(hake$year))),
+  "beta_temp" = 0,
+  # "beta_dist" = 0,
+  "ln_tau_epsilon"=0,
+  # "ln_tau_omega"=0, 
+  "ln_kappa"=0,
+  "ln_phi" = 0,
+  # "ln_H_input" = c(0, 0),
+  "finv_power" = 0,
+  
+  "logit_rhoE" = 0,
+  
+  # SDM random effects
+  # "omega_s"=rnorm(nrow(hake_survey_spde$c0)),
+  "epsilon_st"=matrix(0, nrow=nrow(hake_survey_spde$c0), ncol=hake_bestfitRE_temp_sdist_Data$n_t),
+  
+  # smooth functions
+  bs = rep(0, ncol(sm$Xs)),
+  b_smooth = rep(0, sum(sm$sm_dims)),
+  ln_smooth_sigma = rep(0, length(sm$sm_dims))
+)
+
+hake_bestfitRE_temp_sdist_Obj = MakeADFun( data=hake_bestfitRE_temp_sdist_Data,
+                                             parameters=hake_bestfitRE_temp_sdist_Params,
+                                             random= c("epsilon_st", "b_smooth"),
+                                             DLL = "hake_bestfitRE_temp_sdist")
+
+# Optimize
+hake_bestfitRE_temp_sdist_Opt = nlminb( start=hake_bestfitRE_temp_sdist_Obj$par, obj=hake_bestfitRE_temp_sdist_Obj$fn, grad=hake_bestfitRE_temp_sdist_Obj$gr )
+# add getJointPrecision for index
+hake_bestfitRE_temp_sdist_Opt$SD = sdreport( hake_bestfitRE_temp_sdist_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+hake_bestfitRE_temp_sdist_report = hake_bestfitRE_temp_sdist_Obj$report()
+
+hake_bestfitRE_temp_sdist_output <- list(hake_bestfitRE_temp_sdist_Obj = hake_bestfitRE_temp_sdist_Obj,
+                                           hake_bestfitRE_temp_sdist_Opt = hake_bestfitRE_temp_sdist_Opt,
+                                           hake_bestfitRE_temp_sdist_report = hake_bestfitRE_temp_sdist_report)
+
+save(hake_bestfitRE_temp_sdist_output,
+     file = here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_sdist_output.rda"))
+```
+
+
+
+### Compare candidate models
+
+```{r, cache = TRUE, include = FALSE}
+
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_dist_year")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_sdist_year")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_sdist")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_dist")))
+
+hake_bestfitRE_stemp_dist_year_cAIC <- cAIC(model_data = hake_bestfitRE_stemp_dist_year_Data,
+                                              model_obj = hake_bestfitRE_stemp_dist_year_Obj,  
+                                              model_parameters = hake_bestfitRE_stemp_dist_year_Params,
+                                              random = c("epsilon_st", "b_smooth"),
+                                              DLL = "hake_bestfitRE_stemp_dist_year",
+                                              data_observation_names = "D_i")
+
+hake_bestfitRE_stemp_dist_year_AIC <- 2*hake_bestfitRE_stemp_dist_year_Opt$objective + 2 * length(hake_bestfitRE_stemp_dist_year_Opt$par)
+
+hake_bestfitRE_temp_sdist_year_cAIC <- cAIC(model_data = hake_bestfitRE_temp_sdist_year_Data,
+                                              model_obj = hake_bestfitRE_temp_sdist_year_Obj,  
+                                              model_parameters = hake_bestfitRE_temp_sdist_year_Params,
+                                              random = c("epsilon_st", "b_smooth"),
+                                              DLL = "hake_bestfitRE_temp_sdist_year",
+                                              data_observation_names = "D_i")
+
+hake_bestfitRE_temp_sdist_year_AIC <- 2*hake_bestfitRE_temp_sdist_year_Opt$objective + 2 * length(hake_bestfitRE_temp_sdist_year_Opt$par)
+
+hake_bestfitRE_temp_sdist_cAIC <- cAIC(model_data = hake_bestfitRE_temp_sdist_Data,
+                                              model_obj = hake_bestfitRE_temp_sdist_Obj,  
+                                              model_parameters = hake_bestfitRE_temp_sdist_Params,
+                                              random = c("epsilon_st", "b_smooth"),
+                                              DLL = "hake_bestfitRE_temp_sdist",
+                                              data_observation_names = "D_i")
+
+hake_bestfitRE_temp_sdist_AIC <- 2*hake_bestfitRE_temp_sdist_Opt$objective + 2 * length(hake_bestfitRE_temp_sdist_Opt$par)
+
+hake_bestfitRE_stemp_dist_cAIC <- cAIC(model_data = hake_bestfitRE_stemp_dist_Data,
+                                              model_obj = hake_bestfitRE_stemp_dist_Obj,  
+                                              model_parameters = hake_bestfitRE_stemp_dist_Params,
+                                              random = c("epsilon_st", "b_smooth"),
+                                              DLL = "hake_bestfitRE_stemp_dist",
+                                              data_observation_names = "D_i")
+
+hake_bestfitRE_stemp_dist_AIC <- 2*hake_bestfitRE_stemp_dist_Opt$objective + 2 * length(hake_bestfitRE_stemp_dist_Opt$par)
+
+
+```
+
+
+```{r, cache = TRUE, include = FALSE}
+
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_sdist")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_dist")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_sdist")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_dist")))
+
+
+hake_bestfitRE_stemp_sdist_cAIC <- cAIC(model_data = hake_bestfitRE_stemp_sdist_Data,
+                                              model_obj = hake_bestfitRE_stemp_sdist_Obj,  
+                                              model_parameters = hake_bestfitRE_stemp_sdist_Params,
+                                              random = c("epsilon_st", "b_smooth"),
+                                              DLL = "hake_bestfitRE_stemp_sdist",
+                                              data_observation_names = "D_i")
+
+hake_bestfitRE_stemp_sdist_AIC <- 2*hake_bestfitRE_stemp_sdist_Opt$objective + 2 * length(hake_bestfitRE_stemp_sdist_Opt$par)
+
+hake_bestfitRE_temp_cAIC <- cAIC(model_data = hake_bestfitRE_temp_Data,
+                                       model_obj = hake_bestfitRE_temp_Obj,  
+                                       model_parameters = hake_bestfitRE_temp_Params,
+                                       random = c("epsilon_st"),
+                                       DLL = "hake_bestfitRE_temp",
+                                       data_observation_names = "D_i")
+
+hake_bestfitRE_temp_AIC <- 2*hake_bestfitRE_temp_Opt$objective + 2 * length(hake_bestfitRE_temp_Opt$par)
+
+hake_bestfitRE_dist_cAIC <- cAIC(model_data = hake_bestfitRE_dist_Data,
+                                       model_obj = hake_bestfitRE_dist_Obj,  
+                                       model_parameters = hake_bestfitRE_dist_Params,
+                                       random = c("epsilon_st"),
+                                       DLL = "hake_bestfitRE_dist",
+                                       data_observation_names = "D_i")
+
+hake_bestfitRE_dist_AIC <- 2*hake_bestfitRE_dist_Opt$objective + 2 * length(hake_bestfitRE_dist_Opt$par)
+
+hake_bestfitRE_stemp_cAIC <- cAIC(model_data = hake_bestfitRE_stemp_Data,
+                                        model_obj = hake_bestfitRE_stemp_Obj,  
+                                        model_parameters = hake_bestfitRE_stemp_Params,
+                                        random = c("epsilon_st", "b_smooth"),
+                                        DLL = "hake_bestfitRE_stemp",
+                                        data_observation_names = "D_i")
+
+hake_bestfitRE_stemp_AIC <- 2*hake_bestfitRE_stemp_Opt$objective + 2 * length(hake_bestfitRE_stemp_Opt$par)
+
+hake_bestfitRE_sdist_cAIC <- cAIC(model_data = hake_bestfitRE_sdist_Data,
+                                        model_obj = hake_bestfitRE_sdist_Obj,  
+                                        model_parameters = hake_bestfitRE_sdist_Params,
+                                        random = c("epsilon_st", "b_smooth"),
+                                        DLL = "hake_bestfitRE_sdist",
+                                        data_observation_names = "D_i")
+
+hake_bestfitRE_sdist_AIC <- 2*hake_bestfitRE_sdist_Opt$objective + 2 * length(hake_bestfitRE_sdist_Opt$par)
+
+hake_bestfitRE_temp_dist_cAIC <- cAIC(model_data = hake_bestfitRE_temp_dist_Data,
+                                  model_obj = hake_bestfitRE_temp_dist_Obj,  
+                                  model_parameters = hake_bestfitRE_temp_dist_Params,
+                                  random = c("epsilon_st"),
+                                  DLL = "hake_bestfitRE_temp_dist",
+                                  data_observation_names = "D_i")
+
+hake_bestfitRE_temp_dist_AIC <- 2*hake_bestfitRE_temp_dist_Opt$objective + 2 * length(hake_bestfitRE_temp_dist_Opt$par)
+
+```
+
+
+```{r, cache = TRUE, include = FALSE}
+
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_sdist_year_v1")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_year")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_dist_year")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_stemp_year")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_sdist_year")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_year1")))
+dyn.load(dynlib(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_noFE")))
+
+hake_bestfitRE_stemp_sdist_year_v1_cAIC <- cAIC(model_data = hake_bestfitRE_stemp_sdist_year_v1_Data,
+                 model_obj = hake_bestfitRE_stemp_sdist_year_v1_Obj,  
+                 model_parameters = hake_bestfitRE_stemp_sdist_year_v1_Params,
+                 random = c("epsilon_st", "b_smooth"),
+                 DLL = "hake_bestfitRE_stemp_sdist_year_v1",
+                 data_observation_names = "D_i")
+
+hake_bestfitRE_stemp_sdist_year_v1_AIC <- 2*hake_bestfitRE_stemp_sdist_year_v1_Opt$objective + 2 * length(hake_bestfitRE_stemp_sdist_year_v1_Opt$par)
+
+hake_bestfitRE_temp_year_cAIC <- cAIC(model_data = hake_bestfitRE_temp_year_Data,
+                 model_obj = hake_bestfitRE_temp_year_Obj,  
+                 model_parameters = hake_bestfitRE_temp_year_Params,
+                 random = c("epsilon_st"),
+                 DLL = "hake_bestfitRE_temp_year",
+                 data_observation_names = "D_i")
+
+hake_bestfitRE_temp_year_AIC <- 2*hake_bestfitRE_temp_year_Opt$objective + 2 * length(hake_bestfitRE_temp_year_Opt$par)
+
+hake_bestfitRE_dist_year_cAIC <- cAIC(model_data = hake_bestfitRE_dist_year_Data,
+                 model_obj = hake_bestfitRE_dist_year_Obj,  
+                 model_parameters = hake_bestfitRE_dist_year_Params,
+                 random = c("epsilon_st"),
+                 DLL = "hake_bestfitRE_dist_year",
+                 data_observation_names = "D_i")
+
+hake_bestfitRE_dist_year_AIC <- 2*hake_bestfitRE_dist_year_Opt$objective + 2 * length(hake_bestfitRE_dist_year_Opt$par)
+
+hake_bestfitRE_stemp_year_cAIC <- cAIC(model_data = hake_bestfitRE_stemp_year_Data,
+                 model_obj = hake_bestfitRE_stemp_year_Obj,  
+                 model_parameters = hake_bestfitRE_stemp_year_Params,
+                 random = c("epsilon_st", "b_smooth"),
+                 DLL = "hake_bestfitRE_stemp_year",
+                 data_observation_names = "D_i")
+
+hake_bestfitRE_stemp_year_AIC <- 2*hake_bestfitRE_stemp_year_Opt$objective + 2 * length(hake_bestfitRE_stemp_year_Opt$par)
+
+hake_bestfitRE_sdist_year_cAIC <- cAIC(model_data = hake_bestfitRE_sdist_year_Data,
+                 model_obj = hake_bestfitRE_sdist_year_Obj,  
+                 model_parameters = hake_bestfitRE_sdist_year_Params,
+                 random = c("epsilon_st", "b_smooth"),
+                 DLL = "hake_bestfitRE_sdist_year",
+                 data_observation_names = "D_i")
+
+hake_bestfitRE_sdist_year_AIC <- 2*hake_bestfitRE_sdist_year_Opt$objective + 2 * length(hake_bestfitRE_sdist_year_Opt$par)
+
+hake_bestfitRE_year1_cAIC <- cAIC(model_data = hake_bestfitRE_year1_Data,
+                 model_obj = hake_bestfitRE_year1_Obj,  
+                 model_parameters = hake_bestfitRE_year1_Params,
+                 random = c("epsilon_st"),
+                 DLL = "hake_bestfitRE_year1",
+                 data_observation_names = "D_i")
+
+hake_bestfitRE_year1_AIC <- 2*hake_bestfitRE_year1_Opt$objective + 2 * length(hake_bestfitRE_year1_Opt$par)
+
+hake_bestfitRE_noFE_cAIC <- cAIC(model_data = hake_bestfitRE_noFE_Data,
+                 model_obj = hake_bestfitRE_noFE_Obj,  
+                 model_parameters = hake_bestfitRE_noFE_Params,
+                 random = c("epsilon_st"),
+                 DLL = "hake_bestfitRE_noFE",
+                 data_observation_names = "D_i")
+
+hake_bestfitRE_noFE_AIC <- 2*hake_bestfitRE_noFE_Opt$objective + 2 * length(hake_bestfitRE_noFE_Opt$par)
+
+```
+
+
+```{r, include = FALSE}
+
+fixed_effects_model_comparison_table <- data.frame(model = c("as.factor(year) + temp + dist",
+                                                             "as.factor(year) + s(temp) + s(dist)",
+                                                             "as.factor(year) + temp",
+                                                             "as.factor(year) + dist",
+                                                             "as.factor(year) + s(temp)",
+                                                             "as.factor(year) + s(dist)",
+                                                             "as.factor(year)",
+                                                             "temp + dist",
+                                                             "s(temp) + s(dist)",
+                                                             "temp",
+                                                             "dist",
+                                                             "s(temp)",
+                                                             "s(dist)",
+                                                             "as.factor(year) + s(temp) + dist",
+                                                             "as.factor(year) + temp + s(dist)",
+                                                             "temp + s(dist)",
+                                                             "s(temp) + dist",
+                                                             "no fixed effects"),
+                                     AIC = c(model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_AIC,
+                                             hake_bestfitRE_stemp_sdist_year_v1_AIC,
+                                             hake_bestfitRE_temp_year_AIC,
+                                             hake_bestfitRE_dist_year_AIC,
+                                             hake_bestfitRE_stemp_year_AIC,
+                                             hake_bestfitRE_sdist_year_AIC,
+                                             hake_bestfitRE_year1_AIC,
+                                             hake_bestfitRE_temp_dist_AIC,
+                                             hake_bestfitRE_stemp_sdist_AIC,
+                                             hake_bestfitRE_temp_AIC,
+                                             hake_bestfitRE_dist_AIC,
+                                             hake_bestfitRE_stemp_AIC,
+                                             hake_bestfitRE_sdist_AIC,
+                                             hake_bestfitRE_stemp_dist_year_AIC,
+                                             hake_bestfitRE_temp_sdist_year_AIC,
+                                             hake_bestfitRE_temp_sdist_AIC,
+                                             hake_bestfitRE_stemp_dist_AIC,
+                                             hake_bestfitRE_noFE_AIC),
+                                     cAIC = c(model3_3_spatial_aniso_spatiotemporal_IID_aniso_missing_years_cAIC,
+                                              hake_bestfitRE_stemp_sdist_year_v1_cAIC,
+                                              hake_bestfitRE_temp_year_cAIC,
+                                              hake_bestfitRE_dist_year_cAIC,
+                                              hake_bestfitRE_stemp_year_cAIC,
+                                              hake_bestfitRE_sdist_year_cAIC,
+                                              hake_bestfitRE_year1_cAIC,
+                                              hake_bestfitRE_temp_dist_cAIC,
+                                             hake_bestfitRE_stemp_sdist_cAIC,
+                                             hake_bestfitRE_temp_cAIC,
+                                             hake_bestfitRE_dist_cAIC,
+                                             hake_bestfitRE_stemp_cAIC,
+                                             hake_bestfitRE_sdist_cAIC,
+                                             hake_bestfitRE_stemp_dist_year_cAIC,
+                                             hake_bestfitRE_temp_sdist_year_cAIC,
+                                             hake_bestfitRE_temp_sdist_cAIC,
+                                             hake_bestfitRE_stemp_dist_cAIC,
+                                              hake_bestfitRE_noFE_cAIC))
+
+```
+
+```{r}
+fixed_effects_model_comparison_table %>% 
+  arrange(cAIC) %>% 
+  mutate(AIC = round(AIC, 2)) %>% 
+  mutate(cAIC = round(cAIC, 2)) %>% 
+  kbl(caption = "AIC and cAIC scores for the fixed effect structures.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+```
+
+
+
+
+
+Examine our best fit model
+```{r}
+### Best fit model
+load(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_sdist_output.rda"))
+
+hake_bestfitRE_sdist_Obj <- hake_bestfitRE_sdist_output$hake_bestfitRE_sdist_Obj
+
+hake_bestfitRE_sdist_Opt <- hake_bestfitRE_sdist_output$hake_bestfitRE_sdist_Opt
+
+hake_bestfitRE_sdist_report <- hake_bestfitRE_sdist_output$hake_bestfitRE_sdist_report
+
+
+hake %>% group_by(year) %>% summarise(total = sum(NASC)) -> hake_year_sums
+actual_years <- (min(hake$year):max(hake$year))[c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11)!= -999]
+hake_SDM_annual_estimates <- data.frame(year = (min(hake$year):max(hake$year)),
+                                        estimate = colSums(exp(hake_bestfitRE_sdist_report$ln_d_gt)))
+
+hake_SDM_annual_estimates %>% 
+  left_join(hake_year_sums, by = "year") %>% 
+  filter(year %in% actual_years) -> hake_SDM_annual_estimates
+
+ggplot(hake_SDM_annual_estimates, aes(x = total, y = estimate, label = year)) +
+  geom_point() +
+  geom_text()
+
+hist(colSums(exp(hake_bestfitRE_sdist_report$ln_d_gt)))
+
+### Second best fit model
+load(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "hake_fixed_effects_candidate_models", "hake_bestfitRE_temp_sdist_output.rda"))
+
+hake_bestfitRE_temp_sdist_Obj <- hake_bestfitRE_temp_sdist_output$hake_bestfitRE_temp_sdist_Obj
+
+hake_bestfitRE_temp_sdist_Opt <- hake_bestfitRE_temp_sdist_output$hake_bestfitRE_temp_sdist_Opt
+
+hake_bestfitRE_temp_sdist_report <- hake_bestfitRE_temp_sdist_output$hake_bestfitRE_temp_sdist_report
+
+
+hake %>% group_by(year) %>% summarise(total = sum(NASC)) -> hake_year_sums
+actual_years <- (min(hake$year):max(hake$year))[c(0,-999,1,-999,2,-999,3,-999,4,-999,5,6,7,-999,8,-999,9,-999,10,-999,11)!= -999]
+hake_SDM_annual_estimates <- data.frame(year = (min(hake$year):max(hake$year)),
+                                        estimate = colSums(exp(hake_bestfitRE_temp_sdist_report$ln_d_gt)))
+
+hake_SDM_annual_estimates %>% 
+  left_join(hake_year_sums, by = "year") %>% 
+  filter(year %in% actual_years) -> hake_SDM_annual_estimates
+
+ggplot(hake_SDM_annual_estimates, aes(x = total, y = estimate, label = year)) +
+  geom_point() +
+  geom_text()
+
+hist(colSums(exp(hake_bestfitRE_temp_sdist_report$ln_d_gt)))
+```
+
+
+
+
+#### Export the tables of AIC and cAIC for the supplemental results
+```{r}
+write.csv(random_effects_model_comparison_table, here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "04.10_hake_random_effects_model_comparison_table.csv"))
+write.csv(fixed_effects_model_comparison_table, here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "04.10_hake_fixed_effects_model_comparison_table.csv"))
+```

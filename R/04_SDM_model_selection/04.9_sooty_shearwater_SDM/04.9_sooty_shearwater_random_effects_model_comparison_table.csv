@@ -1,0 +1,12 @@
+"","model","AIC","cAIC"
+"1","Spatial OFF + Spatiotemporal OFF",4857.63975335675,NA
+"2","Spatial OFF + Spatiotemporal IID (isotropic)",4686.74932317493,4573.89689350014
+"3","Spatial OFF + Spatiotemporal IID (anisotropic)",4689.52448429745,4575.05125891473
+"4","Spatial OFF + Spatiotemporal AR1 (isotropic)",4684.03082800277,4571.29865481871
+"5","Spatial OFF + Spatiotemporal AR1 (anisotropic)",4686.92240478024,4572.48786020527
+"6","Spatial ON + Spatiotemporal OFF (isotropic)",4799.00273618461,4773.15039558377
+"7","Spatial ON + Spatiotemporal IID (isotropic)",4801.0027361846,4775.15039558379
+"8","Spatial ON + Spatiotemporal AR1 (isotropic)",4801.0027361846,4775.15039558379
+"9","Spatial ON + Spatiotemporal OFF (anisotropic)",4803.09708368996,4775.55436994497
+"10","Spatial ON + Spatiotemporal IID (anisotropic)",4685.8717834623,4573.43830431939
+"11","Spatial ON + Spatiotemporal AR1 (anisotropic)",4687.0763723396,4573.96943883479
