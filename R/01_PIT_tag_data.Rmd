@@ -1,0 +1,980 @@
+---
+title: "PIT Tag Data Processing"
+author: "Markus Min"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#### Description
+
+This Rmd goes through the steps to query PTAGIS for the analysis of salmon marine survival. It then processes this dataset for inclusion in the model.
+
+### PTAGIS query
+
+For our analysis, we need to query juveniles that were detected during their outmigration.
+
+We do not need a high level of detail at the interrogation sites; we just need to know if they were detected as juveniles and then again as adults. Therefore, we will query PTAGIS for an Interrogation Summary.
+
+This query needs to be broken up into multiple smaller queries due to the PTAGIS limit of 1,000,000 rows per report.
+
+The query was created using the following steps:
+
+From the [PTAGIS Dashboard](https://dashboard.ptagis.org): Advanced Reporting Home Page > Create Query Builder2 Report > Interrogation Summary
+
+Once in Query Builder2, select the following filters:
+- 1 Attributes: To the attributes that are selected by default (Tag, Mark File, Site, First Time, Last Time, First Antenna Group, Last Antenna Group, Release Date, Species, Run, Rear Type, and Release Site), add the following attributes: Hatchery, Mark Length, Release Site Basin, Release Site Subbasin, Stock, 
+- 2 Metrics: Count (this is the standard metric)
+
+Then, we construct multiple queries based on time so as to not exceed the PTAGIS limit.
+- 15 Release Year
+  - 1998-2024 (individually queried)
+    - Because of the PTAGIS limit on query size, some of these queries were further broken up two queries, one for January-April and one for May-December, using the 11 Release Date field
+- 25 Species:
+  - Chinook
+
+
+Run Report, and download as a CSV. The reports are named to indicate the time period queried.
+
+
+### Load PTAGIS Data
+```{r load_libraries_data}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(here)
+library(janitor)
+library(RColorBrewer)
+library(ggthemes)
+
+# Load individual files
+# Note that 2002-2015 (except 2005) have two files, for 01-01 through 04-30 and for 05-01 through 12-31
+# 2002 is different because this split didn't work based on file sizes, so we had to split based on Jan-March and April-December
+single_years <- c(1998:2001, 2005, 2017:2024)
+split_years <- c(2003:2004, 2006:2016)
+
+# get the names of the individual files
+single_files <- paste0("chinook_", single_years, ".csv")
+split_files_1 <- paste0("chinook_", split_years, "-01-01_", split_years, "-04-30", ".csv")
+split_files_2 <- paste0("chinook_", split_years, "-05-01_", split_years, "-12-31", ".csv")
+
+all_files <- c(single_files, split_files_1, split_files_2, "chinook_2002-01-01_2002-03-31.csv",
+               "chinook_2002-04-01_2002-12-31.csv")
+
+# construct the paths to each of the files
+all_file_paths <- here::here("Data", "PTAGIS", all_files)
+
+# Read in all of these files and join them together
+# Remove a bunch of files that contain information that we don't care about
+all_file_paths %>%
+  map(~ read_csv(.x) %>% janitor::clean_names() %>%
+        dplyr::select(tag_code, site_name, first_time_value, last_time_value, release_date_mmddyyyy,
+                      run_name,rear_type_code, release_site_name, hatchery_name, mark_length_mm,
+                      stock_name, release_site_subbasin_name, release_site_basin_name,
+                      first_antenna_group_name, last_antenna_group_name)) %>%
+  list_rbind() -> chinook_data
+
+# for testing - just look at the 2001 data
+# read.csv(here::here("Data", "PTAGIS", "chinook_2001.csv")) %>% janitor::clean_names() %>% 
+#         dplyr::select(tag_code, site_name, first_time_value, last_time_value, release_date_mmddyyyy,
+#                       run_name,rear_type_code, release_site_name, hatchery_name, mark_length_mm,
+#                       stock_name, release_site_subbasin_name, release_site_basin_name,
+#                       first_antenna_group_name, last_antenna_group_name) -> chinook_data
+
+# make some changes to data types
+chinook_data %>% 
+  mutate(first_time_value = mdy_hms(first_time_value)) %>% 
+  mutate(last_time_value = mdy_hms(last_time_value)) %>% 
+  mutate(release_date_mmddyyyy = mdy(release_date_mmddyyyy)) -> chinook_data
+
+# chinook data has over 21 million observations!
+all_chinook_tag_codes <- unique(chinook_data$tag_code)
+# these are from 14,626,796 individual fish
+
+# for testing: let's only take 100k random fish from the total
+set.seed(123)
+sample_chinook_tag_codes <- sample(all_chinook_tag_codes, 100000, replace = F)
+
+test_chinook_data <- subset(chinook_data, tag_code %in% sample_chinook_tag_codes)
+
+# To make R run smoother, let's remove the massive dataset
+# rm(chinook_data)
+
+# remove individuals marked as  adults (based on mark length being less)
+# chinook_data <- subset(chinook_data, mark_length_mm < 350)
+
+```
+
+Visualize the mark length distribution
+```{r}
+
+release_site_stock_group <- data.frame(group = c(rep("Snake River", 4), "Lower Columbia", rep("Middle Columbia", 4),
+                                                 "Upper Columbia", "Upper Columbia"),
+                                       release_site_basin_name = c("Clearwater", "Lower Snake", "Salmon", "Snake River",
+                                                                   "Lower Columbia",
+                                                                   "Deschutes", "Middle Columbia", "Yakima", "John Day",
+                                                                   "Upper Columbia", "Spokane"))
+
+# drop the unknown runs
+# drop the release sites that are not upstream of BON
+chinook_data %>% 
+  filter(!(run_name %in% c("N/A", "Unknown"))) %>% 
+  filter(!(release_site_basin_name %in% c("Puget Sound", "Willamette"))) %>% 
+  filter(!(is.na(release_site_basin_name))) -> chinook_data
+
+table(chinook_data$release_site_basin_name)
+
+chinook_data %>% 
+  left_join(release_site_stock_group, by = "release_site_basin_name") -> chinook_data
+  
+
+table(is.na(chinook_data$mark_length_mm))
+table(is.na(chinook_data$mark_length_mm), chinook_data$release_site_subbasin_name)
+
+# there are some clear typos, also some adults that are over a meter long.
+chinook_data <- subset(chinook_data, mark_length_mm < 500 | is.na(mark_length_mm))
+
+chinook_mark_length_plot <- ggplot(chinook_data, aes(x = mark_length_mm)) +
+  geom_histogram() +
+  facet_wrap(~group + run_name) +
+  scale_x_continuous(lim = c(0, 300))
+
+ggsave(here::here("figures", "chinook_mark_length_plot.png"), chinook_mark_length_plot,
+       height = 12, width = 12)
+```
+
+
+
+
+
+
+### Load transport data
+
+This loads the transport data queried from CBR DART
+
+```{r load_transport_data}
+# load file for each individual year
+years <- 2000:2024
+for (i in years){
+  if (i == 2000){
+    transport_data <- read.csv(here::here("Data", "transport", "chinook_transport_2001.csv"))
+  } else {
+    new_data <- read.csv(here::here("Data", "transport", paste0("chinook_transport_", i, ".csv")))
+    transport_data %>% 
+      bind_rows(new_data) -> transport_data
+  }
+}
+
+# export just as tag code and transport
+transport_data %>% 
+  dplyr::select(-c(empty, esu_type)) %>% 
+  mutate(transport = ifelse(trans_status == "T", 1, 0)) %>% 
+  filter(transport == 1) %>%  # we're missing all fish that weren't sampled or transported anyway, so just keep positives
+  mutate(obs_time = ymd_hms(obs_time)) %>% 
+  mutate(year = year(obs_time)) %>% 
+  dplyr::select(tag_id, transport) -> transport_data_export
+
+write.csv(transport_data_export, here::here("model_inputs", "chinook_transport.csv"), row.names = FALSE)
+```
+
+
+
+
+```{r classify_sites}
+BON_juvenile_sites <- c("B1J - BONNEVILLE PH1 JUVENILE", 
+                        "B2J - Bonneville PH2 Juvenile", 
+                        "BCC - BON PH2 Corner Collector", 
+                        "BVX - Bonneville PH1 Juvenile (Exp.)", 
+                        "BVJ - BONNEVILLE DAM DMS1 SUBSAMPLE")
+
+JDA_juvenile_sites <- c("JDJ - John Day Dam Juvenile")
+
+# TDA_juvenile_sites <- c()
+
+MCN_juvenile_sites <- c("MCJ - McNary Dam Juvenile", "MCX - MCNARY JUVENILE EXPERIMENTAL")
+
+ICH_juvenile_adult_sites <- c("ICH - Ice Harbor Dam (Combined)")
+
+LGO_juvenile_sites <- c("GOJ - Little Goose Dam Juvenile")
+
+LMO_juvenile_sites <- c("LMJ - Lower Monumental Dam Juvenile")
+
+LGR_juvenile_sites <- c("GRJ - Lower Granite Dam Juvenile", "GRS - Lower Granite Dam Spillway",
+                         "GRX - LOWER GRANITE EXPERIMENTAL")
+
+RRE_juvenile_sites <- c("RRJ - Rocky Reach Dam Juvenile")
+
+BON_adult_sites <- c("BHL - Adult Fishway at BONH", 
+                "BO1 - Bonneville Bradford Is. Ladder",
+                "BO2 - Bonneville Cascades Is. Ladder",
+                "BO3 - Bonneville WA Shore Ladder/AFF",
+                "BO4 - Bonneville WA Ladder Slots",
+                "B2A - BONNEVILLE ADULT WA SHORE",
+                "BWL - Bonneville WA Shore Ladder",
+                "BONAFF - BON - Adult Fish Facility",
+                "BON - Bonneville Dam Complex")
+
+TDA_adult_sites <- c("TD1 - The Dalles East Fish Ladder", "TD2 - The Dalles North Fish Ladder")
+
+JDA_adult_sites <- c("JO1 - John Day South Fish Ladder", "JO2 - John Day North Fish Ladder")
+
+MCN_adult_sites <-c("MC1 - McNary Oregon Shore Ladder", "MC2 - McNary Washington Shore Ladder")
+
+LMO_adult_sites <- c("LMA - Lower Monumental Adult Ladders")
+
+LGO_adult_sites <- c("GOA - Little Goose Fish Ladder")
+
+ICH_adult_sites <- c("IHA - Ice Harbor Adult")
+
+LGR_adult_sites <- c("GRA - Lower Granite Dam Adult")
+
+PRA_adult_sites <- c("PRA - Priest Rapids Adult")
+
+RIS_adult_sites <- c("RIA - Rock Island Adult")
+
+RRE_adult_sites <- c("RRF - Rocky Reach Fishway")
+
+WEL_adult_sites <- c("WEA - Wells Dam, DCPUD Adult Ladders")
+
+# combine all of these
+site_groups <- list(
+  BON_juvenile_sites = BON_juvenile_sites,
+  JDA_juvenile_sites = JDA_juvenile_sites,
+  MCN_juvenile_sites = MCN_juvenile_sites,
+  ICH_juvenile_adult_sites = ICH_juvenile_adult_sites,
+  LGO_juvenile_sites = LGO_juvenile_sites,
+  LMO_juvenile_sites = LMO_juvenile_sites,
+  LGR_juvenile_sites = LGR_juvenile_sites,
+  RRE_juvenile_sites = RRE_juvenile_sites,
+  BON_adult_sites = BON_adult_sites,
+  TDA_adult_sites = TDA_adult_sites,
+  JDA_adult_sites = JDA_adult_sites,
+  MCN_adult_sites = MCN_adult_sites,
+  LMO_adult_sites = LMO_adult_sites,
+  LGO_adult_sites = LGO_adult_sites,
+  ICH_adult_sites = ICH_adult_sites,
+  LGR_adult_sites = LGR_adult_sites,
+  PRA_adult_sites = PRA_adult_sites,
+  RIS_adult_sites = RIS_adult_sites,
+  RRE_adult_sites = RRE_adult_sites,
+  WEL_adult_sites = WEL_adult_sites
+)
+
+site_lookup <- enframe(site_groups, name = "dam_det", value = "site_name") %>%
+  unnest(site_name)
+
+# add a new column to chinook_data based on membership in these groups
+chinook_data %>% 
+  left_join(site_lookup, by = "site_name") -> chinook_data
+
+# now, note that detections in adult ladders close to release date are juvenile,
+# and detections in juvenile detection sites that occur much after release date are adult
+# cutoff for juveniles - there are fish that can make it to the ocean and back in 4 months (minijacks)
+# but how does that relate to release date?
+# If we make this 4 months, there are too many false positives.
+# So let's do conservative estimates for each: 60 days for juveniles, 2 years for adults
+# cutoff for adults - tricky, since you have some fish that return very early and others
+# that hang out in fresh water for a long time
+chinook_data %>% 
+  mutate(life_stage = ifelse(first_time_value - ymd_hms(paste0(release_date_mmddyyyy, " 00:00:00")) < days(60), "juvenile",
+                             ifelse(first_time_value - ymd_hms(paste0(release_date_mmddyyyy, " 00:00:00")) > days(730), "adult",
+                                    "unknown"))) -> chinook_data
+
+# Use antennas to split apart "ICH - Ice Harbor Dam (Combined)" into adult and juvenile bypass
+chinook_data %>%
+  mutate(dam_det = ifelse(site_name == "ICH - Ice Harbor Dam (Combined)" & first_antenna_group_name == "FULL FLOW BYPASS", "ICH juvenile bypass",
+                          ifelse(site_name == "ICH - Ice Harbor Dam (Combined)" & first_antenna_group_name != "FULL FLOW BYPASS", "ICH adult ladders", dam_det))) -> chinook_data
+```
+
+```{r SAR}
+BON_adult_sites <- c("BHL - Adult Fishway at BONH", 
+                "BO1 - Bonneville Bradford Is. Ladder",
+                "BO2 - Bonneville Cascades Is. Ladder",
+                "BO3 - Bonneville WA Shore Ladder/AFF",
+                "BO4 - Bonneville WA Ladder Slots",
+                "B2A - BONNEVILLE ADULT WA SHORE",
+                "BWL - Bonneville WA Shore Ladder",
+                "BONAFF - BON - Adult Fish Facility",
+                "BON - Bonneville Dam Complex")
+
+adult_sites <- c(BON_adult_sites, "MC1 - McNary Oregon Shore Ladder", "MC2 - McNary Washington Shore Ladder",
+                 "GRA - Lower Granite Dam Adult")
+
+BON_juvenile_sites <- c("B1J - BONNEVILLE PH1 JUVENILE", 
+                        "B2J - Bonneville PH2 Juvenile", 
+                        "BCC - BON PH2 Corner Collector", 
+                        "BVX - Bonneville PH1 Juvenile (Exp.)", 
+                        "BVJ - BONNEVILLE DAM DMS1 SUBSAMPLE")
+```
+
+### Split into run types 
+
+We can use the `run_name` and `release_site_basin_name` fields that we queried from PTAGIS to categorize fish into stock groups.
+
+Stock groups by release site basin name: 
+- Snake River
+  - Clearwater, Lower Snake, Salmon, Snake River
+- Lower Columbia
+  - Lower Columbia
+- Middle Columbia
+  - Deschutes, Middle Columbia, Yakima, John Day
+- Upper Columbia
+  - Upper Columbia
+
+- Release sites we need to drop:
+  - Puget Sound, Willamette
+
+Some fish are missing a release site basin name - let's see if we can figure out where they're from.
+- Based on release_site_name:
+  - "SNAKER - SNAKE RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)" -> "Snake"
+  - "GRANDR - GRANDE RONDE RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)" -> "Snake"
+  - "SELWYR - SELWAY RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)" -> "Snake"
+  - "YAKIMR - YAKIMA RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)" -> "Middle Columbia"
+  - "COLR - COLUMBIA RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)" & stock_name %in% c("MIDCO", "MIDCOL") -> "Middle Columbia"
+    - some with this release site are missing a stock_name. They're also wild fish... detections are at McNary and John Day Dams. Could be Middle or Upper Columbia fish. We'll have to leave this as unknown.
+
+```{r}
+chinook_data %>% 
+  filter(!(duplicated(tag_code))) -> chinook_data_unique
+
+table(chinook_data_unique$run_name, chinook_data_unique$release_site_basin_name)
+
+# Fix the missing release_site_basin_name info (if we can)
+filter(chinook_data, is.na(release_site_basin_name))
+
+chinook_data %>% 
+  mutate(release_site_basin_name = ifelse(release_site_name %in% c("SNAKER - SNAKE RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)",
+                                                                   "GRANDR - GRANDE RONDE RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)",
+                                                                   "SELWYR - SELWAY RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)"), "Snake River",
+                                          ifelse(release_site_name == "YAKIMR - YAKIMA RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)" |
+                                                                          release_site_name == "COLR - COLUMBIA RIVER (ARCHAIC - REPLACED WITH REACH-SPECIFIC DEFINITIONS)" & stock_name %in% c("MIDCO", "MIDCOL"), "Middle Columbia", release_site_basin_name))) -> chinook_data
+
+table(subset(chinook_data, is.na(release_site_basin_name))$release_site_name)
+# Unable to determine where these fish are from - the vast majority are just labeled as "Columbia River". But this is overall only a small proportion of the overall fish.
+```
+
+```{r}
+release_site_stock_group <- data.frame(group = c(rep("Snake River", 4), "Lower Columbia", rep("Middle Columbia", 4),
+                                                 "Upper Columbia", "Upper Columbia"),
+                                       release_site_basin_name = c("Clearwater", "Lower Snake", "Salmon", "Snake River",
+                                                                   "Lower Columbia",
+                                                                   "Deschutes", "Middle Columbia", "Yakima", "John Day",
+                                                                   "Upper Columbia", "Spokane"))
+
+# drop the unknown runs
+# drop the release sites that are not upstream of BON
+chinook_data %>% 
+  filter(!(run_name %in% c("N/A", "Unknown"))) %>% 
+  filter(!(release_site_basin_name %in% c("Puget Sound", "Willamette"))) %>% 
+  filter(!(is.na(release_site_basin_name))) -> chinook_data
+
+table(chinook_data$release_site_basin_name)
+
+chinook_data %>% 
+  left_join(release_site_stock_group, by = "release_site_basin_name") -> chinook_data
+
+# Load the transport data
+transport_data <- read.csv(here::here("model_inputs", "chinook_transport.csv"))
+transport_tag_codes <- transport_data$tag_id
+
+# For summaries of juvenile detections, keep only those fish that were detected in 
+# juvenile sites at Bonneville or transported
+chinook_data %>% 
+  filter(dam_det == "BON_juvenile_sites" & life_stage == "juvenile") %>% 
+  filter(!(duplicated(tag_code))) -> chinook_BON_juv
+
+chinook_data %>% 
+  filter(tag_code %in% transport_tag_codes) %>% 
+  filter(!(duplicated(tag_code))) -> chinook_transport_juv
+
+
+# # filter adults to only include those that were detected as juveniles at BON OR that were transported
+# 
+# # first let's compare the transported and BON juv det
+BON_juv_tag_codes <- unique(chinook_BON_juv$tag_code)
+transport_juv_tag_codes <- unique(chinook_transport_juv$tag_code)
+# transport_and_juv_tag_codes <- intersect(BON_juv_tag_codes, transport_juv_tag_codes)
+# # this is only a tiny fraction... but let's see why this is happening
+# length(transport_and_juv_tag_codes)/(length(transport_juv_tag_codes) + length(BON_juv_tag_codes))
+# 
+# subset(chinook_data, tag_code %in% transport_and_juv_tag_codes) -> double_det_fish
+# 
+# # ok, so these are pretty clearly fish that were transported as juveniles and fell back 
+# # as adults via juvenile bypass systems (primarily BCC). You can see that by the timing.
+# # our script correctly labeled these fish as adults. Let's only look at the "juvenile"
+# # detections
+# subset(double_det_fish, life_stage == "juvenile") -> double_det_fish_juv
+# table(double_det_fish_juv$dam_det)
+# # none of the juvenile detections are classified as BON - so that's great. Easy to resolve. We'll fix this above on
+# # line 307 to filter on det at BON_juvenile_sites as juveniles.
+
+
+chinook_data %>% 
+  filter(tag_code %in% c(transport_tag_codes, BON_juv_tag_codes)) %>% 
+  filter(dam_det == "BON_adult_sites") %>% 
+  filter(!(duplicated(tag_code))) -> chinook_BON_adult
+
+# for annual counts at BON, add together transported and non-transported fish
+chinook_BON_juv %>% 
+  bind_rows(chinook_transport_juv) %>% 
+  mutate(group_run = paste0(group, " - ", run_name)) %>% 
+  mutate(release_year = year(release_date_mmddyyyy)) %>% 
+  group_by(release_year) %>% 
+  count(group_run) %>% 
+  dplyr::rename(BON_juv_counts = n) -> annual_counts_BON_juv
+
+chinook_BON_adult %>% 
+  mutate(group_run = paste0(group, " - ", run_name)) %>% 
+  mutate(release_year = year(release_date_mmddyyyy)) %>% 
+  group_by(release_year) %>% 
+  count(group_run) %>% 
+  dplyr::rename(BON_adult_counts = n) -> annual_counts_BON_adult
+
+annual_counts_BON_juv %>% 
+  left_join(annual_counts_BON_adult, by = c("release_year", "group_run")) %>% 
+  ungroup() %>% 
+  complete(release_year, group_run, fill = list(BON_juv_counts = 0, BON_adult_counts = 0)) -> annual_counts_BON
+
+```
+
+
+
+### Plot detections at BON, by stock group + run
+
+```{r}
+annual_counts_BON %>% 
+  dplyr::select(-BON_adult_counts) %>% 
+  pivot_wider(names_from = release_year, values_from = BON_juv_counts) -> annual_juvenile_counts_BON_table
+# %>% 
+#   kbl(caption = "Juvenile counts at Bonneville Dam")
+# %>% 
+#   kable_styling(latex_options = "HOLD_position")
+
+annual_counts_BON %>% 
+  dplyr::select(-BON_juv_counts) %>% 
+  pivot_wider(names_from = release_year, values_from = BON_adult_counts) -> annual_adult_counts_BON_table
+# %>% 
+#   kbl(caption = "Adult counts at Bonneville Dam")
+# %>% 
+#   kable_styling(latex_options = "HOLD_position")
+
+write.csv(annual_adult_counts_BON_table, here::here("figures", "annual_adult_counts_BON_table.csv"), row.names = F)
+write.csv(annual_juvenile_counts_BON_table, here::here("figures", "annual_juvenile_counts_BON_table.csv"), row.names = F)
+```
+
+# Process data for modeling
+
+For inclusion in the SAR model, we will have our data with one row per fish, with the following columns:
+- tag_code
+- BON_juv_det
+- BON_juv_det_site
+- BON_juv_det_time
+- adult_det
+- adult_det_site
+- adult_det_time
+- run_name
+- rear_type_code
+- release_site_name
+- release_site_subbasin_name
+- release_site_basin_name
+- group
+
+
+```{r}
+chinook_data %>% 
+  filter(tag_code %in% c(chinook_BON_juv$tag_code, transport_tag_codes)) -> chinook_conditional_data
+
+# Use the sequence of detections to remove adult detections in juvenile bypass systems
+# and juvenile detections in adult systems
+
+# get a list of fish that were ever detected in the BON adult ladders
+# problem is, this won't fix some other wonky dudes that were never seen in the BON 
+# adult ladders but were seen in the BON juvenile systems
+chinook_conditional_data %>% 
+  filter(tag_code %in% chinook_BON_adult$tag_code) -> chinook_conditional_adult_data
+
+chinook_conditional_data %>% 
+  arrange(tag_code, first_time_value) %>% 
+  mutate(dam_det_type = ifelse(grepl("juvenile", dam_det), "juvenile",
+                               ifelse(grepl("adult", dam_det), "adult", "neither"))) %>% 
+  filter(dam_det_type != "neither") %>% 
+  group_by(tag_code) %>% 
+  # identify juvenile usage of adult ladders
+  # catch any leading adult detections followed by detection in JBS - but not Bonneville, since many
+  # fish are seen there for the first time as adults
+  mutate(dam_det_type = ifelse(row_number() == 1 & dam_det_type == "adult" & lead(dam_det_type) == "juvenile" & dam_det != "BON_adult_sites",
+                               "juvenile", dam_det_type)) %>% 
+  # identify adult usage of juvenile bypass systems
+  # catch any juvenile detections that are sandwiched between adult detections
+  mutate(dam_det_type = ifelse(row_number() == 1, dam_det_type,
+                               ifelse(dam_det_type == "juvenile" & lead(dam_det_type) == "adult" & lag(dam_det_type) == "adult",
+                               "adult", dam_det_type))) %>%
+  # run the same line three times to catch any multiple juvenile bypass movements by adults 
+  mutate(dam_det_type = ifelse(row_number() == 1, dam_det_type,
+                               ifelse(dam_det_type == "juvenile" & lag(dam_det_type) == "adult",
+                       "adult", dam_det_type))) %>%
+  mutate(dam_det_type = ifelse(row_number() == 1, dam_det_type,
+                               ifelse(dam_det_type == "juvenile" & lag(dam_det_type) == "adult",
+                       "adult", dam_det_type))) %>%
+  mutate(dam_det_type = ifelse(row_number() == 1, dam_det_type,
+                               ifelse(dam_det_type == "juvenile" & lag(dam_det_type) == "adult",
+                       "adult", dam_det_type))) %>%
+  mutate(transition = ifelse(dam_det_type == "adult" & lag(dam_det_type == "juvenile") |
+                               dam_det_type == "adult" & lag(site_name) %in% c("TWX - Estuary Towed Array (Exp.)",
+                                                                               "PD7 - Columbia River Estuary rkm 70", 
+                                                                               "PD6 - Columbia River Estuary rkm 68", 
+                                                                               "PD5 - Columbia River Estuary rkm 62", 
+                                                                               "PD8 - Columbia River Estuary rkm 82", 
+                                                                               "SID - Sauvie Island Dairy Creek"), 1, 0)) -> chinook_conditional_data
+
+# drop any individuals that were only seen at BON as adults
+# but make sure to keep any individuals that were transported
+chinook_conditional_data %>% 
+  group_by(tag_code) %>% 
+  filter(any(dam_det == "BON_juvenile_sites" & dam_det_type == "juvenile")) -> chinook_conditional_data_BON_det
+
+subset(chinook_conditional_data, tag_code %in% transport_tag_codes) -> chinook_conditional_data_transported
+
+chinook_conditional_data_BON_det %>% 
+  bind_rows(chinook_conditional_data_transported) -> chinook_conditional_data
+
+# use the new field of dam_det_type to re-classify movements
+chinook_conditional_data %>%
+  ungroup() %>%
+  mutate(dam_det = ifelse(grepl("adult", dam_det) & dam_det_type == "juvenile", gsub("adult", "juvenile_det_in_adult", dam_det), dam_det)) %>% 
+  mutate(dam_det = ifelse(grepl("juvenile", dam_det) & dam_det_type == "adult", gsub("juvenile", "adult_det_in_juvenile", dam_det), dam_det)) -> chinook_conditional_data
+  
+#   mutate(dam_det = ifelse(dam_det == "BON_juvenile_sites" & dam_det_type == "adult",
+#                           "BON_adult_sites",
+#                           ifelse(dam_det == "BON_adult_sites" & dam_det_type == "juvenile",
+#                                  "BON_juvenile_sites", dam_det))) -> chinook_conditional_data
+
+
+# chinook_conditional_adult_data %>%
+#   group_by(tag_code) %>%
+#   summarise(transitions = sum(transition)) -> chinook_conditional_adult_data_sum
+# 
+# table(chinook_conditional_adult_data_sum$transitions)
+# 
+# two_transitions <- subset(chinook_conditional_adult_data_sum, transitions == 2)$tag_code
+# no_transitions <- subset(chinook_conditional_adult_data_sum, transitions == 0)$tag_code
+# 
+# subset(chinook_conditional_adult_data, tag_code %in% no_transitions)
+# subset(chinook_conditional_adult_data, tag_code %in% two_transitions)
+```
+
+
+```{r}
+# Use detection timing in relation to release_date to assign 
+# dam_det_values <- unique(chinook_conditional_data$dam_det)
+# juvenile_det_sites <- dam_det_values[grep("juvenile", dam_det_values)]
+# adult_det_sites <- dam_det_values[grep("adult", dam_det_values)]
+# 
+# 
+# chinook_conditional_data %>% 
+#   mutate(site_usage = ifelse(dam_det %in% juvenile_det_sites & life_stage == "adult", "juvenile usage by adult",
+#                              ifelse(dam_det %in% adult_det_sites & life_stage == "juvenile", "adult usage by juvenile",
+#                                     "expected usage"))) -> chinook_conditional_data
+# 
+# 
+# subset(chinook_conditional_data, site_usage %in% c("juvenile usage by adult", "adult usage by juvenile"))$tag_code -> naughty_fish
+# 
+# subset(chinook_conditional_data, tag_code %in% naughty_fish & first_time_value > ymd_hms("2010-01-01 00:00:00")) %>% 
+#   dplyr::select(tag_code, site_name, first_time_value, release_date_mmddyyyy, site_usage) %>% 
+#   arrange(tag_code, first_time_value)
+# 
+# # drop these detections for purposes of calculating SAR
+# chinook_conditional_data %>%
+#   filter(!(site_usage %in% c("juvenile usage by adult", "adult usage by juvenile"))) -> chinook_conditional_data
+
+```
+
+
+```{r}
+# create separate data frames for juvenile detection and adult detection
+
+# Create the juvenile detection data frame
+# ignore any individuals that were transported - those are dealt with below
+subset(chinook_conditional_data, !(tag_code %in% transport_tag_codes)) %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "BON_juvenile_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(BON_juv_det_time = first_time_value) -> chinook_BON_juv_det
+
+# create the detection data frame for juveniles transported below BON
+# note that here the detection as juveniles is the place that they were transported
+# from - and then they were deposited below Bonneville Dam
+
+# Based on LGR to BON taking approximately 40 hours, create a df for delay
+# between detection for barging and approximate arrival below BON
+barge_time = data.frame(dam_det = c("BON_juvenile_sites", "JDA_juvenile_sites",
+         "MCN_juvenile_sites", "ICH_juvenile_adult_sites",
+         "LGO_juvenile_sites", "LMO_juvenile_sites", 
+         "LGR_juvenile_sites", "RRE_juvenile_sites"),
+         barging_time = c(hours(0), hours(40*2/8),
+                  hours(40*4/8), hours(40*5/8),
+                  hours(40*7/8), hours(40*6/8),
+                  hours(40*8/8), hours(40*8/8)))
+
+
+subset(chinook_conditional_data, tag_code %in% transport_tag_codes) %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det %in% c("BON_juvenile_sites", "JDA_juvenile_sites",
+         "MCN_juvenile_sites", "ICH_juvenile_adult_sites",
+         "LGO_juvenile_sites", "LMO_juvenile_sites", 
+         "LGR_juvenile_sites", "RRE_juvenile_sites")) %>% 
+  left_join(barge_time, by = "dam_det") %>% 
+  dplyr::rename(barge_site = dam_det) %>% 
+  mutate(dam_det = "barged_below_BON") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::mutate(BON_juv_det_time = first_time_value + barging_time) %>% 
+  dplyr::rename(BON_juvenile_sites = barged_below_BON) %>% 
+  dplyr::select(tag_code, BON_juv_det_time, BON_juvenile_sites) -> chinook_transported_juv_det
+
+# Create the adult detection data frame - at Bonneville
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "BON_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(BON_adult_det_time = first_time_value) -> chinook_BON_adult_det
+
+# Create the adult detection data frame - at The Dalles
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "TDA_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(TDA_adult_det_time = first_time_value) -> chinook_TDA_adult_det
+
+# Create the adult detection data frame - at John Day
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "JDA_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(JDA_adult_det_time = first_time_value) -> chinook_JDA_adult_det
+
+# Create the adult detection data frame - at McNary
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "MCN_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(MCN_adult_det_time = first_time_value) -> chinook_MCN_adult_det
+
+# Create the adult detection data frame - at Priest Rapids
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "PRA_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(PRA_adult_det_time = first_time_value) -> chinook_PRA_adult_det
+
+# Create the adult detection data frame - at Rock Island
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "RIS_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(RIS_adult_det_time = first_time_value) -> chinook_RIS_adult_det
+
+# Create the adult detection data frame - at Rocky Reach
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "RRE_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(RRE_adult_det_time = first_time_value) -> chinook_RRE_adult_det
+
+# Create the adult detection data frame - at Wells
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "WEL_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(WEL_adult_det_time = first_time_value) -> chinook_WEL_adult_det
+
+# Create the adult detection data frame - at Ice Harbor
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det %in% c("ICH_adult_sites", "ICH adult ladders")) %>% 
+  mutate(dam_det == "ICH_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(ICH_adult_det_time = first_time_value) -> chinook_ICH_adult_det
+
+# Create the adult detection data frame - at Lower Monumental
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "LMO_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(LMO_adult_det_time = first_time_value) -> chinook_LMO_adult_det
+
+# Create the adult detection data frame - at Little Goose
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "LGO_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(LGO_adult_det_time = first_time_value) -> chinook_LGO_adult_det
+
+# Create the adult detection data frame - at Lower Granite
+chinook_conditional_data %>% 
+  dplyr::select(tag_code, dam_det, first_time_value) %>% 
+  filter(dam_det == "LGR_adult_sites") %>% 
+  # order by detection timing, keep only first detection at a site
+  arrange(tag_code, first_time_value) %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  mutate(observed = 1) %>% 
+  pivot_wider(
+    names_from = dam_det,
+    values_from = observed,
+    values_fill = 0
+  ) %>% 
+  dplyr::rename(LGR_adult_det_time = first_time_value) -> chinook_LGR_adult_det
+
+# create data frame for metadata for each tag code
+chinook_conditional_data %>% 
+  filter(!(duplicated(tag_code))) %>% 
+  dplyr::select(-c(site_name, first_time_value, last_time_value, dam_det)) -> chinook_conditional_metadata
+
+
+# combine all of the above
+bind_rows(chinook_BON_juv_det, chinook_transported_juv_det) %>% 
+  left_join(chinook_BON_adult_det, by = "tag_code") %>% 
+  left_join(chinook_TDA_adult_det, by = "tag_code") %>% 
+  left_join(chinook_JDA_adult_det, by = "tag_code") %>% 
+  left_join(chinook_MCN_adult_det, by = "tag_code") %>% 
+  left_join(chinook_PRA_adult_det, by = "tag_code") %>% 
+  left_join(chinook_RIS_adult_det, by = "tag_code") %>% 
+  left_join(chinook_RRE_adult_det, by = "tag_code") %>% 
+  left_join(chinook_WEL_adult_det, by = "tag_code") %>% 
+  left_join(chinook_ICH_adult_det, by = "tag_code") %>% 
+  left_join(chinook_LMO_adult_det, by = "tag_code") %>% 
+  left_join(chinook_LGO_adult_det, by = "tag_code") %>% 
+  left_join(chinook_LGR_adult_det, by = "tag_code") %>% 
+  left_join(chinook_conditional_metadata, by = "tag_code") -> chinook_det_hist
+
+# replace NAs with zeros for adult sites
+# keep NAs for detection times, if fish were never detected there
+chinook_det_hist %>% 
+  mutate(across(c("LGR_adult_sites", "BON_adult_sites", "MCN_adult_sites", "ICH_adult_sites", "PRA_adult_sites", "WEL_adult_sites",
+ "RIS_adult_sites", "RRE_adult_sites", "TDA_adult_sites", "JDA_adult_sites", "LGO_adult_sites", "LMO_adult_sites"),
+         ~ replace_na(., 0))) -> chinook_det_hist
+
+
+# check that our ocean ages are reasonable
+chinook_det_hist %>% 
+  mutate(ocean_age = pmin(BON_adult_det_time, TDA_adult_det_time, JDA_adult_det_time, MCN_adult_det_time,
+                         PRA_adult_det_time, RIS_adult_det_time, RRE_adult_det_time, WEL_adult_det_time,
+                         ICH_adult_det_time, LMO_adult_det_time, LGO_adult_det_time, LGR_adult_det_time, na.rm = T) - BON_juv_det_time) -> chinook_det_hist
+
+# make the ocean_age column days
+chinook_det_hist %>% 
+  mutate(ocean_age = as.numeric(ocean_age, units = "days")) -> chinook_det_hist
+ggplot(chinook_det_hist, aes(x = ocean_age)) +
+  geom_histogram() +
+  xlab("Ocean age (days)") +
+  scale_x_continuous(breaks = seq(0, 2000, 200))
+
+# there are a lot of individuals with ocean age 0 or negative. Let's investigate those with very short ocean ages
+
+subset(chinook_det_hist, ocean_age >= 0 & ocean_age <= 50)$tag_code -> short_ocean_ages
+
+subset(chinook_det_hist, ocean_age <= 0)$tag_code -> negative_ocean_ages
+
+subset(chinook_data, tag_code %in% short_ocean_ages) %>% 
+  arrange(tag_code, first_time_value)
+
+subset(chinook_conditional_data, tag_code %in% negative_ocean_ages) %>% 
+  arrange(tag_code, first_time_value) %>% 
+  dplyr::select(tag_code, site_name, first_time_value, release_date_mmddyyyy, dam_det_type)
+
+subset(chinook_conditional_data, tag_code %in% short_ocean_ages) %>% 
+  arrange(tag_code, first_time_value) %>% 
+  dplyr::select(tag_code, site_name, first_time_value, release_date_mmddyyyy, dam_det_type)
+
+
+
+subset(chinook_det_hist, tag_code == "384.3B239597C0")
+
+# okay, so a lot of these look like juveniles that went through the adult ladder. We'll have to make sure that any detections in adult ladders that are close to the release_date are considered juvenile detections
+# there are also some detections in the juvenile bypass systems that look like adult fallbacks.
+# So, juvenile detections that occur >1 year after release date should be considered adult movements,
+# and adult detections that occur < 3 months after release date should be considered juvenile movements
+# We also need to re-classify the Ice Harbor Dam (Combined) detections - those are juvenile when close to release date and adult when much later
+
+
+
+# Get rid of any fish where the ocean age is less than 180 days - these are minijacks
+# that likely never reached the ocean
+
+chinook_det_hist %>% 
+  filter(ocean_age >= 180 | is.na(ocean_age)) -> chinook_det_hist_filter
+```
+
+
+```{r export_data_for_model}
+# what we ultimately need for the model is just juvenile detection, adult detection, timing of each, and which adult ladder they were first detected at
+
+# get which column has the minimum time (this is the dam where adults were first detected)
+chinook_det_hist_filter %>% 
+  dplyr::select(c("tag_code", "BON_adult_det_time", "TDA_adult_det_time", "JDA_adult_det_time", "MCN_adult_det_time",
+  "PRA_adult_det_time", "RIS_adult_det_time", "RRE_adult_det_time", "WEL_adult_det_time",
+  "ICH_adult_det_time", "LMO_adult_det_time", "LGO_adult_det_time", "LGR_adult_det_time")) %>% 
+  pivot_longer(cols = c("BON_adult_det_time", "TDA_adult_det_time", "JDA_adult_det_time", "MCN_adult_det_time",
+  "PRA_adult_det_time", "RIS_adult_det_time", "RRE_adult_det_time", "WEL_adult_det_time",
+  "ICH_adult_det_time", "LMO_adult_det_time", "LGO_adult_det_time", "LGR_adult_det_time"), names_to = "dam", values_to = "time") %>% 
+  group_by(tag_code) %>%
+  slice_min(order_by = time, n = 1, with_ties = FALSE, na_rm = TRUE) %>% 
+  dplyr::rename(adult_dam = dam) %>% 
+  mutate(adult_dam = gsub("_det_time", "", adult_dam)) %>% 
+  dplyr::select(-time) -> chinook_det_hist_filter_adult_det_times
+  
+
+
+chinook_det_hist_filter %>% 
+  mutate(adult_det_time = pmin(BON_adult_det_time, TDA_adult_det_time, JDA_adult_det_time, MCN_adult_det_time,
+                         PRA_adult_det_time, RIS_adult_det_time, RRE_adult_det_time, WEL_adult_det_time,
+                         ICH_adult_det_time, LMO_adult_det_time, LGO_adult_det_time, LGR_adult_det_time, na.rm = T)) %>% 
+  dplyr::select(tag_code, BON_juv_det_time, BON_juvenile_sites, adult_det_time) %>% 
+  mutate(adult_det = ifelse(!(is.na(adult_det_time)), 1, 0)) %>% 
+  dplyr::rename(juv_det = BON_juvenile_sites) %>% 
+  left_join(chinook_det_hist_filter_adult_det_times, by = "tag_code") -> chinook_det_hist_final
+
+# add ocean age
+chinook_det_hist_final %>% 
+  mutate(ocean_age = adult_det_time - BON_juv_det_time) -> chinook_det_hist_final
+
+# add our tag code metadata
+chinook_det_hist_final %>% 
+  left_join(chinook_conditional_metadata, by = "tag_code") -> chinook_det_hist_final
+
+chinook_det_hist_final %>% 
+  mutate(run_year = year(BON_juv_det_time)) -> chinook_det_hist_final
+
+
+write.csv(chinook_det_hist_final, here::here("model_inputs", "chinook_det_hist.csv"), row.names = F)
+
+table(subset(chinook_det_hist_final, adult_det == 1)$adult_det, subset(chinook_det_hist_final, adult_det == 1)$adult_dam)
+
+```
+
+
+
+```{r calculate_crude_SAR}
+table(chinook_det_hist_final$run_year, paste0(chinook_det_hist_final$group, " ", chinook_det_hist_final$run_name))
+
+chinook_det_hist_final %>% 
+  group_by(group, run_name, run_year) %>% 
+  summarise(SAR = mean(adult_det),
+            N = sum(juv_det)) %>% 
+  mutate(stock = paste0(group, " ", run_name)) -> SAR_raw
+
+ggplot(SAR_raw, aes(x = run_year, y = SAR, color = stock, size = N)) +
+  geom_line(linewidth = 1) +
+  geom_point() +
+  scale_color_tableau(palette = "Tableau 10")
+
+ggplot(subset(SAR_raw, stock == "Snake River Fall"), aes(x = run_year, y = SAR, size = N)) +
+  geom_line(linewidth = 1) +
+  geom_point()
+```
+
+
+
+

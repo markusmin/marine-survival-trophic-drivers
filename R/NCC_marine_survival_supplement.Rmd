@@ -1,0 +1,877 @@
+---
+title: "Supplemental Material"
+author: Markus A. Min, Brian J. Burke, Lisa G. Crozier, Cheryl A. Morgan, Jeannette
+  E. Zamon, Toby D. Auth, James T. Thorson, and Mark D. Scheuerell
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+subtitle: Trophic drivers of salmon marine survival revealed by spatiotemporal data integration
+bibliography: JSOES.bib
+csl: ecology.csl
+---
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(here)
+library(kableExtra)
+library(ggthemes)
+library(viridis)
+library(ggpubr)
+```
+
+## Supplemental Methods
+
+### 1 Survey Descriptions
+
+#### Juvenile Salmon and Ocean Ecosystem Survey (JSOES)
+
+##### Surface trawl sampling
+
+The Juvenile Salmon and Ocean Ecosystem Survey (JSOES) targets juvenile salmonids and other pelagic nekton in the upper 20 m of the water column by towing a 264 Nordic trawl for 30 minutes at a speed of approximately 6.5 km/h. The rope trawl is 108 m long, with a mouth opening that measures 30 m wide by 20 m deep. The net has variable and graded mesh sizes, ranging from 162.6 cm in the throat to 8.9 cm in the cod end, with the cod end having a further 0.8 m liner sewn into it to capture small fish and other nekton.
+
+##### Genetic assignment of Chinook Salmon to stock groups
+
+Juvenile Chinook Salmon caught by the JSOES were assigned to specific run and life history groups using genetic methods and catch per unit effort was then calculated for each genetic stock group. For each juvenile Chinook Salmon caught by the JSOES, caudal fin clips were stored in 100% ethanol and DNA subsequently extracted. The genetic stock identification methods used varied between the time periods 2003-2012 and 2013-2022. For the time period 2003-2012, polymerase chain reaction (PCR) was conducted to amplify 13 microsatellite DNA loci, whereas for the time period 2013-2022 PCR was used to genotype individuals using 185 single-nucleotide polymorphism loci. In both cases, the results were compared to a genetic baseline to assign individual fish to stock groups using the genetic stock identification program ONCOR [@Kalinowski2007]. More detail on stock assignment methods from 2003-2012 can be found in @Teel2015 and more detail on the methods used from 2013-2022 can be found in @Hess2013a and @VanDoornik2019. Because of the genetic legacy of broodstock transfers between stocks from the Columbia and Snake Rivers, genetic stock identification cannot distinguish among certain Chinook Salmon populations upstream of Bonneville Dam. As such, ocean-caught juveniles were necessarily combined into an interior fall stock group, which is composed mostly of Upper Columbia River Summer/Fall and Snake River Fall Chinook Salmon. ONCOR [@Kalinowski2007] was used to compute the catch per unit effort of each genetic stock group in each tow by allocating each individual to the different stock groups proportional to the probability of assignment in that stock group. Combined with the size-based life history classifications, the genetic stock identification methods allowed us to analyze the ocean distributions of two Chinook Salmon groups: Interior Fall subyearlings and Interior Fall yearlings.
+
+##### Bongo net sampling
+
+Bongo net tows were conducted using a 0.6 m bongo net with 335 $\mu$m mesh. Sampling with this net was conducted by letting out 60 m of cable before retrieving the net at a rate of 30 m/min while being towed at 2 knots. As such, the net was towed obliquely from the surface, to depth, and back again, reaching a maximum depth of 20-30 m. Samples were preserved in 5% buffered formalin/seawater solution for laboratory analysis. In the laboratory, samples were rinsed and organisms identified to the lowest taxonomic level and life history stage and enumerated. More detail on the laboratory procedure can be found in @morganColumbiaRiverPlume2005. We then assigned each taxon identified in the JSOES Bongo data to a functional group in alignment with yearling and subyearling Chinook Salmon diet items [@Daly2009, @Daly2017]. Ultimately, four functional groups were extracted for investigation as potential juvenile salmon prey items: shrimp larvae, non-Cancer crab larvae, Cancer crab larvae, and hyperiid amphipods. The life history stages of each of these groups that are typically consumed by juvenile salmonids (i.e., excluding any adults for the larval groups) were exported for further modeling. The assignment of each taxon to a functional group can be found in Supplemental Methods 2. As a proxy for energy availability from prey, biomass was used as the unit of measurement. Biomass for each combination of taxonomic level and life history stage in a sample was calculated by multiplying the density (number per m-3) by the carbon weight of individuals of that developmental stage, with carbon content estimates derived from the literature or from estimates of dry weight [@morganColumbiaRiverPlume2005].
+
+
+##### Seabird observations
+
+Seabird observations were collected early in the morning, beginning between 0450 and 0515 hours, prior to trawl or bongo net sampling. This ensured that seabirds were not attracted to the ship by fishing activity. Observations were collected by a trained seabird observer as the vessel transited west to east along each transect. This observer made continuous observations within a 300-m-wide bow-to-beam strip transect on the side of the vessel with the best visibility, which was almost always the south-facing (starboard) side to minimize morning sun glare that interferes with an observer’s ability to detect birds. Seabird counts and the area surveyed in each year were assigned to the nearest trawl station, with the density of each species (number per square kilometer) calculated by dividing the count by the area surveyed for each station.
+
+
+#### Pacific Whiting Conservation Cooperative (PWCC)/Pre-Recruit Survey (PRS)
+
+The Pacific Whiting Conservation Cooperative (PWCC) survey, which was conducted from 2001-2009, and the Pre-Recruit Survey (PRS), conducted most years since 2011, were used to provide data on young-of-year (YOY) rockfishes, a key prey item for juvenile Chinook. While the PRS samples fixed transects perpendicular to the coast, the PWCC survey did not have a fixed sampling design but typically conducted transects while transiting south. The varying spatial coverage of each of these surveys can found in Supplemental Results 2. As mentioned in the main text, these two surveys used the same fishing gear and sampling methods and therefore are treated as one continuous time series in our analysis. These surveys deployed a modified-Cobb midwater trawl with a 26 m headrope, a net opening with a height and width of 12 m, and a 9.5 mm cod-end liner to retain micronekton. The target depth of the headrope is 30 m. This net was towed for 15 minutes at approximately 2 knots.
+
+The contents of each trawl were sorted and identified to the lowest possible taxonomic level onboard. Although the PWCC survey and the PRS capture many taxa that are salmon forage [@Friedman2018], the PWCC taxonomic assignments are only considered reliable for YOY rockfishes (John Field, pers. comm.). Therefore, we only use the combined PWCC/PRS time series of YOY rockfishes for this analysis. 
+
+#### Joint U.S. and Canada Pacific Hake Integrated Acoustic and Trawl Survey (Hake Survey)
+
+The Joint U.S. and Canada Pacific Hake Integrated Acoustic and Trawl Survey (Hake Survey) is a biennial survey targeting Pacific Hake (*Merluccius productus*) on the West Coasts of the United States and Canada. This proceeds south to north from Point Conception in California to Dixon Entrance in British Columbia. Transects, spaced 10 nautical miles apart, are conducted east-west perpendicular to the coast, with transects extending from approximately the 50 m isobath to the 1500 m isobath. In this survey, downward-looking Simrad EK60 echosounders operating at multiple frequencies (18, 38, 70, 120, and/or 200kHz, depending on the year) recorded acoustic backscatter from the sea surface to a depth of 750 m continuously during daylight hours. Midwater and bottom trawls were conducted opportunistically and adaptively during the survey and used to assign species, size, age, and sex composition to the acoustic backscatter. The specific trawl nets deployed depended on the vessel, and a more detailed description of the trawl nets and biological sampling can be found in @DeBlois2020. For this study, acoustic backscatter (measured as nautical-area-backscattering coefficient, or NASC, m2 nmi-2) attributed to adult (age 2+) Pacific Hake were binned into 2.5 nautical mile (4.63 km) bins (Supplemental Results 2). Survey data from 2001-2021, odd years (plus 2012) were included in this study.
+
+### 2 JSOES Bongo functional groups
+
+```{r load_reformat_Table_S1}
+# bongo_groups <- read.csv(here::here("figures", "JSOES_bongo_functional_groups.csv"), row.names = 1)
+# 
+# bongo_groups %>% 
+#   filter(group %in% c("Cancer crab larvae", "Hyperiid amphipod", "shrimp larvae", "Non-Cancer crab larvae")) %>% 
+#   dplyr::rename(taxonomy = genus_species) %>% 
+#   kbl(caption = "The taxa assigned to each of the four functional groups from the JSOES Bongo data.") %>% 
+#   kable_styling(latex_options = "HOLD_position")
+
+bongo_groups_summary <- read.csv(here::here("figures", "paper_figures", "JSOES_bongo_functional_groups_summary.csv"), row.names = 1)
+
+# bongo_groups_summary %>% 
+#   dplyr::select(genus_species, life_history_stages, group, prop_group_total) %>% 
+#   filter(group %in% c("Cancer crab larvae", "Hyperiid amphipod", "shrimp larvae", "Non-Cancer crab larvae")) %>% 
+#   mutate(group = ifelse(group == "shrimp larvae", "Shrimp larvae", group)) %>% 
+#   arrange(group, desc(prop_group_total)) %>% 
+#   mutate(prop_group_total = round(prop_group_total, 3)) %>% 
+#   dplyr::rename("Taxonomy" = genus_species, "Functional Group" = group, 
+#                 "Proportion of Functional Group" = prop_group_total,
+#                 "Life History Stages" = life_history_stages) %>% 
+#   kbl(caption = "Table S1. The taxa assigned to each of the four functional groups from the JSOES Bongo data, along with the proportion of that functional group that this taxon represents.") %>% 
+#   kable_styling(latex_options = "HOLD_position")
+
+bongo_groups_summary %>% 
+  dplyr::select(genus_species, life_history_stages, group, prop_group_total) %>% 
+  filter(group %in% c("Cancer crab larvae", "Hyperiid amphipod", "shrimp larvae", "Non-Cancer crab larvae")) %>% 
+  mutate(group = ifelse(group == "shrimp larvae", "Shrimp larvae", group)) %>% 
+  arrange(group, desc(prop_group_total)) %>% 
+  mutate(prop_group_total = round(prop_group_total, 3)) %>% 
+  dplyr::rename("Taxonomy" = genus_species, "Functional Group" = group, 
+                "Proportion of Functional Group" = prop_group_total,
+                "Life History Stages" = life_history_stages) -> Table_S1_export
+
+write.csv(Table_S1_export, here::here("figures", "paper_figures", "Table_S1.csv"))
+
+# Load edits from Cheryl Morgan
+table_s1_cam <- read.csv(here::here("Data", "Table_S1_CAM.csv"), row.names = 1)
+
+# change some taxonomic groupings based on Cheryl's notes
+bongo_groups_summary %>% 
+  dplyr::select(genus_species, life_history_stages, group, prop_group_total) %>% 
+  filter(group %in% c("Cancer crab larvae", "Hyperiid amphipod", "shrimp larvae", "Non-Cancer crab larvae")) %>% 
+  mutate(group = ifelse(group == "shrimp larvae", "Shrimp larvae", group)) %>% 
+  arrange(group, desc(prop_group_total)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Cancer antennarius", "Cancer antennarius/gracilis", genus_species)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Cancer oregonensis", "Cancer oregonensis/productus", genus_species)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Pugettia, not productus", "Pugettia", genus_species)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Pugettia producta", "Pugettia", genus_species)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Pugettia gracilis", "Pugettia", genus_species)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Pachycheles rudis", "Pachycheles", genus_species)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Crangon spp.", "Crangonidae", genus_species)) %>% 
+  mutate(genus_species = ifelse(genus_species == "Cumacea, lg type", "Cumacea", genus_species)) %>% 
+  left_join(dplyr::select(table_s1_cam, Taxonomy, CAM.Life.History), join_by(genus_species == Taxonomy)) %>% 
+  dplyr::select(-life_history_stages) %>% 
+  mutate(CAM.Life.History = ifelse(genus_species == "Pachycheles", "Megalopa", CAM.Life.History)) %>% 
+  dplyr::rename("Life History Stages" = CAM.Life.History) -> table_s1
+
+table_s1 %>% 
+  filter(genus_species != "Cancer spp.") %>% 
+  group_by(genus_species, group, `Life History Stages`) %>% 
+  summarise(prop_group_total = sum(prop_group_total)) %>% 
+  arrange(group, desc(prop_group_total)) %>% 
+  dplyr::rename("Taxonomy" = genus_species, "Functional Group" = group, 
+                "Proportion of Functional Group" = prop_group_total) %>% 
+  relocate("Life History Stages", .after = "Taxonomy") %>% 
+  kbl(caption = "Table S1. The taxa assigned to each of the four functional groups from the JSOES Bongo data, along with the proportion of that functional group that this taxon represents.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+# export it
+table_s1 %>% 
+  filter(genus_species != "Cancer spp.") %>% 
+  group_by(genus_species, group, `Life History Stages`) %>% 
+  summarise(prop_group_total = sum(prop_group_total)) %>% 
+  arrange(group, desc(prop_group_total)) %>% 
+  dplyr::rename("Taxonomy" = genus_species, "Functional Group" = group, 
+                "Proportion of Functional Group" = prop_group_total) %>% 
+  relocate("Life History Stages", .after = "Taxonomy")  -> table_s1_for_export
+
+write.csv(table_s1_for_export, here::here("figures", "paper_figures", "Table_S1_supplement.csv"))
+```
+
+### 3 Mesh and projection grids {.tabset .tabset-pills}
+
+#### JSOES Midwater Trawl
+
+![JSOES midwater trawl samples (red triangles), mesh (black lines), and the projection grid (gray circles).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/mesh_figures/JSOES_trawl_mesh_plot.png){width=50%}
+
+#### JSOES Bongo Net
+
+![JSOES bongo net samples (red triangles), mesh (black lines), and the projection grid (gray circles).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/mesh_figures/JSOES_bongo_mesh_plot.png){width=50%}
+
+#### JSOES Seabird Observations
+
+![JSOES seabird observations (red triangles), mesh (black lines), and the projection grid (gray circles).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/mesh_figures/JSOES_seabirds_mesh_plot.png){width=50%}
+
+#### PRS/PWCC
+
+![PRS/PWCC samples (red triangles), mesh (black lines), and the projection grid (gray circles).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/mesh_figures/PRS_PWCC_mesh_plot.png){width=50%}
+
+#### Hake Survey
+
+![Hake survey samples (red circles), mesh (black lines), and the projection grid (gray circles).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/mesh_figures/hake_mesh_plot.png){width=50%}
+
+
+### 4 Sample-based approach for estimating uncertainty in derived quantities
+
+This approach estimates the uncertainty in a derived quantity by taking samples of both fixed and random effects, re-computing the derived quantity, and using the sampling distribution of the derived quantity to approximate uncertainty [@thorsonSpatioTemporalModelsEcologists2024]. In this approach, samples are generated by assuming that fixed and random effects are normally distributed with their mean given by their maximum likelihood estimates (for fixed effects) or their empirical Bayes estimates (for random effects), and their variance given by the inverse of their inverse joint precision matrix, $\mathbf{Q}_{joint}$. For each sample drawn from this distribution, the values of fixed and random effects are plugged into the fitted TMB model, which then generates a new value of the derived quantity. We conducted this sampling approach with 500 samples to estimate the uncertainty in our overlap metrics.
+
+
+## Supplemental Results
+
+
+### 1 PIT-Tag Data Filtering
+
+![Outmigration timing (detection at Bonneville Dam or transport below Bonneville Dam as juveniles) for the two focal stocks, Snake River Fall and Upper Columbia Summer/Fall Chinook. The red dotted line represents June 15, which is the cutoff for inclusion in our dataset (only fish to the left of the dotted line were retained).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/outmigration_timing_plot_SRF_UCSF.png){width=100%}
+
+
+### 2 Survey Data {.tabset .tabset-pills}
+
+#### Subyearling Interior Fall Chinook
+
+![Subyearling Interior Fall Chinook catches in the JSOES Midwater Trawl.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/cssif_june_dist_plot.png){width=100%}
+
+#### Yearling Interior Fall Chinook
+
+![Yearling Interior Fall Chinook catches in the JSOES Midwater Trawl.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/csyif_june_dist_plot.png){width=100%}
+
+
+#### Cancer Crab Larvae
+
+![Cancer Crab Larvae catches in the JSOES Bongo net.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/cancer_crab_larvae_june_biomass_plot.png){width=100%}
+
+#### Hyperiid Amphipods
+
+![Hyperiid amphipod catches in the JSOES Bongo net.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/hyperiid_amphipods_june_biomass_plot.png){width=100%}
+
+#### Non-Cancer Crab Larvae
+
+![Non-Cancer Crab Larvae catches in the JSOES Bongo net.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/non_cancer_crab_larvae_june_biomass_plot.png){width=100%}
+
+#### Shrimp Larvae
+
+![Shrimp Larvae catches in the JSOES Bongo net.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/shrimp_larvae_june_biomass_plot.png){width=100%}
+
+#### Sooty Shearwaters
+
+![Sooty Shearwater observations during JSOES.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/sosh_dist_plot.png){width=100%}
+
+#### Common Murres
+
+![Common Murre observations during JSOES.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/comu_dist_plot.png){width=100%}
+
+#### YOY Rockfishes
+
+![YOY Rockfish (Sebastes spp.) catches from the PWCC survey (2001-2009) and PRS (2011-2021).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/rf_dist_plot.png){width=100%}
+
+#### Pacific Hake
+
+![Hake observations from the Hake Survey.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/survey_data_plots/hake_dist_plot.png){width=100%}
+
+
+### 3 SDM model selection process {.tabset .tabset-pills}
+
+#### Subyearling Interior Fall Chinook
+
+The best fit model for Subyearling Interior Fall Chinook had the following model structure:
+
+*Spatial ON + Spatiotemporal IID + temp + s(dist)*
+
+- Where both the spatial and spatiotemporal random fields are anisotropic, the effect of temperature is linear, and the effect of distance from shore is a smooth spline.
+
+```{r}
+cssif_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.2_cssif_SDM", "04.2_cssif_random_effects_model_comparison_table.csv"), row.names = 1)
+cssif_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.2_cssif_SDM", "04.2_cssif_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+cssif_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(cssif_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(cssif_RE_table$cAIC, na.rm = T),2)) -> cssif_RE_table
+
+cssif_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(cssif_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(cssif_FE_table$cAIC, na.rm = T),2)) -> cssif_FE_table
+
+cssif_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Subyearling Interior Fall Chinook, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+cssif_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Subyearling Interior Fall Chinook using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### Yearling Interior Fall Chinook
+
+The best fit model for Yearling Interior Fall Chinook had the following model structure:
+
+*Spatial ON + Spatiotemporal AR1 + temp*
+
+- Where both the spatial and spatiotemporal random fields are anisotropic, and the effect of temperature is linear.
+
+```{r}
+csyif_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.1_csyif_SDM", "04.1_csyif_random_effects_model_comparison_table.csv"), row.names = 1)
+csyif_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.1_csyif_SDM", "04.1_csyif_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+csyif_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(csyif_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(csyif_RE_table$cAIC, na.rm = T),2)) -> csyif_RE_table
+
+csyif_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(csyif_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(csyif_FE_table$cAIC, na.rm = T),2)) -> csyif_FE_table
+
+csyif_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Yearling Interior Fall Chinook, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+csyif_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Yearling Interior Fall Chinook using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+
+#### Shrimp Larvae
+
+The best fit model for shrimp larvae had the following model structure:
+
+*Spatial ON + Spatiotemporal AR1 + s(dist)*
+
+- Where both the spatial and spatiotemporal random fields are isotropic and the effect of distance from shore is a smooth spline.
+
+```{r}
+shrimp_larvae_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.4.1_shrimp_larvae_biomass_SDM", "04.4.1_shrimp_larvae_biomass_random_effects_model_comparison_table.csv"), row.names = 1)
+shrimp_larvae_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.4.1_shrimp_larvae_biomass_SDM", "04.4.1_shrimp_larvae_biomass_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+shrimp_larvae_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(shrimp_larvae_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(shrimp_larvae_RE_table$cAIC, na.rm = T),2)) -> shrimp_larvae_RE_table
+
+shrimp_larvae_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(shrimp_larvae_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(shrimp_larvae_FE_table$cAIC, na.rm = T),2)) -> shrimp_larvae_FE_table
+
+shrimp_larvae_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Shrimp Larvae, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+shrimp_larvae_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Shrimp Larvae using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### Cancer Crab Larvae
+
+The best fit model for Cancer crab larvae had the following model structure:
+
+*Spatial ON + Spatiotemporal AR1*
+
+- Where both the spatial and spatiotemporal random fields are anisotropic
+
+```{r}
+cancer_crab_larvae_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.5.1_cancer_crab_larvae_biomass_SDM", "04.5.1_cancer_crab_larvae_biomass_random_effects_model_comparison_table.csv"), row.names = 1)
+cancer_crab_larvae_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.5.1_cancer_crab_larvae_biomass_SDM", "04.5.1_cancer_crab_larvae_biomass_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+cancer_crab_larvae_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(cancer_crab_larvae_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(cancer_crab_larvae_RE_table$cAIC, na.rm = T),2)) -> cancer_crab_larvae_RE_table
+
+cancer_crab_larvae_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(cancer_crab_larvae_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(cancer_crab_larvae_FE_table$cAIC, na.rm = T),2)) -> cancer_crab_larvae_FE_table
+
+cancer_crab_larvae_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Cancer Crab Larvae, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+cancer_crab_larvae_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Cancer Crab Larvae using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### Non-Cancer Crab Larvae
+
+The best fit model for non-Cancer crab larvae had the following model structure:
+
+*Spatial ON + Spatiotemporal AR1 + as.factor(year) + dist*
+
+- Where both the spatial and spatiotemporal random fields are isotropic, there is a different intercept term for each year, and the effect of distance from shore is linear.
+
+```{r}
+non_cancer_crab_larvae_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.6.1_non_cancer_crab_larvae_biomass_SDM", "04.6.1_non_cancer_crab_larvae_biomass_random_effects_model_comparison_table.csv"), row.names = 1)
+non_cancer_crab_larvae_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.6.1_non_cancer_crab_larvae_biomass_SDM", "04.6.1_non_cancer_crab_larvae_biomass_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+non_cancer_crab_larvae_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(non_cancer_crab_larvae_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(non_cancer_crab_larvae_RE_table$cAIC, na.rm = T),2)) -> non_cancer_crab_larvae_RE_table
+
+non_cancer_crab_larvae_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(non_cancer_crab_larvae_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(non_cancer_crab_larvae_FE_table$cAIC, na.rm = T),2)) -> non_cancer_crab_larvae_FE_table
+
+non_cancer_crab_larvae_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Non-Cancer Crab Larvae, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+non_cancer_crab_larvae_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Non-Cancer Crab Larvae using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### Hyperiid amphipods
+
+The best fit model for hyperiid amphipods had the following model structure:
+
+*Spatial ON + Spatiotemporal IID*
+
+- Where both the  spatiotemporal random fields are anisotropic
+
+```{r}
+hyperiid_amphipod_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.7.1_hyperiid_amphipod_biomass_SDM", "04.7.1_hyperiid_amphipod_biomass_random_effects_model_comparison_table.csv"), row.names = 1)
+hyperiid_amphipod_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.7.1_hyperiid_amphipod_biomass_SDM", "04.7.1_hyperiid_amphipod_biomass_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+hyperiid_amphipod_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(hyperiid_amphipod_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(hyperiid_amphipod_RE_table$cAIC, na.rm = T),2)) -> hyperiid_amphipod_RE_table
+
+hyperiid_amphipod_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(hyperiid_amphipod_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(hyperiid_amphipod_FE_table$cAIC, na.rm = T),2)) -> hyperiid_amphipod_FE_table
+
+hyperiid_amphipod_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Hyperiid Amphipods, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+hyperiid_amphipod_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Hyperiid Amphipods using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### Common Murres
+
+The best fit model for Common Murres had the following model structure:
+
+*Spatiotemporal IID + dist*
+
+- Where the spatial random fields are anisotropic and the effect of distance from shore is linear.
+
+```{r}
+common_murre_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.8_common_murre_SDM", "04.8_common_murre_random_effects_model_comparison_table.csv"), row.names = 1)
+common_murre_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.8_common_murre_SDM", "04.8_common_murre_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+common_murre_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(common_murre_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(common_murre_RE_table$cAIC, na.rm = T),2)) -> common_murre_RE_table
+
+common_murre_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(common_murre_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(common_murre_FE_table$cAIC, na.rm = T),2)) -> common_murre_FE_table
+
+common_murre_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Common Murres, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+common_murre_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Common Murres using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### Sooty Shearwaters
+
+The best fit model for Sooty Shearwaters had the following model structure:
+
+*Spatiotemporal AR1 + s(dist)*
+
+- Where the spatiotemporal random fields are anisotropic and the effect of distance from shore is a smooth spline.
+
+```{r}
+sooty_shearwater_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.9_sooty_shearwater_SDM", "04.9_sooty_shearwater_random_effects_model_comparison_table.csv"), row.names = 1)
+sooty_shearwater_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.9_sooty_shearwater_SDM", "04.9_sooty_shearwater_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+sooty_shearwater_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(sooty_shearwater_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(sooty_shearwater_RE_table$cAIC, na.rm = T),2)) -> sooty_shearwater_RE_table
+
+sooty_shearwater_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(sooty_shearwater_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(sooty_shearwater_FE_table$cAIC, na.rm = T),2)) -> sooty_shearwater_FE_table
+
+sooty_shearwater_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Sooty Shearwaters, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+sooty_shearwater_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Sooty Shearwaters using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### YOY Rockfishes
+
+The best fit model for YOY rockfishes had the following model structure:
+
+*Spatial ON + Spatiotemporal IID*
+
+- Where both the spatial and spatiotemporal random fields are anisotropic
+
+```{r}
+rf_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.3_rf_SDM", "04.3_rf_random_effects_model_comparison_table.csv"), row.names = 1)
+rf_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.3_rf_SDM", "04.3_rf_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+rf_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(rf_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(rf_RE_table$cAIC, na.rm = T),2)) -> rf_RE_table
+
+rf_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(rf_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(rf_FE_table$cAIC, na.rm = T),2)) -> rf_FE_table
+
+rf_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for YOY Rockfishes, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+rf_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for YOY Rockfishes using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+#### Pacific Hake
+
+The best fit model for Pacific Hake had the following model structure:
+
+*Spatiotemporal AR1 + s(dist)*
+
+- Where the spatiotemporal random fields are isotropic and the effect of distance from shore is a smooth spline.
+
+```{r}
+hake_RE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "04.10_hake_random_effects_model_comparison_table.csv"), row.names = 1)
+hake_FE_table <- read.csv(here::here("R", "04_SDM_model_selection", "04.10_hake_SDM", "04.10_hake_fixed_effects_model_comparison_table.csv"), row.names = 1)
+
+hake_RE_table %>% 
+  mutate(delta_AIC = round(AIC - min(hake_RE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(hake_RE_table$cAIC, na.rm = T),2)) -> hake_RE_table
+
+hake_FE_table %>% 
+  mutate(delta_AIC = round(AIC - min(hake_FE_table$AIC),2)) %>% 
+  mutate(delta_cAIC = round(cAIC - min(hake_FE_table$cAIC, na.rm = T),2)) -> hake_FE_table
+
+hake_RE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Random Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Random effects structure model comparison for Pacific Hake, using a saturated fixed effects structure.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+hake_FE_table %>% 
+  arrange(delta_cAIC) %>% 
+  dplyr::rename("Fixed Effects Structure" = model,
+                "$\\Delta$AIC" = "delta_AIC", 
+                "$\\Delta$cAIC" = "delta_cAIC") %>% 
+  dplyr::select(-c(AIC, cAIC)) %>% 
+  kbl(caption = "Fixed effects structure model comparison for Pacific Hake using the best fit random effects structure identified above.") %>% 
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+### 4 SDM model projections {.tabset .tabset-pills}
+
+#### Subyearling Interior Fall Chinook
+
+![SDM predictions for Subyearling Interior Fall Chinook.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/cssif_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Subyearling Interior Fall Chinook.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/cssif_predict_SE_map.png){width=100%}
+
+#### Yearling Interior Fall Chinook
+
+![SDM predictions for Yearling Interior Fall Chinook.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/csyif_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Yearling Interior Fall Chinook.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/csyif_predict_SE_map.png){width=100%}
+
+#### Cancer Crab Larvae
+
+![SDM predictions for Cancer Crab Larvae.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/cancer_crab_larvae_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Cancer Crab Larvae.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/cancer_crab_larvae_predict_SE_map.png){width=100%}
+
+#### Hyperiid Amphipods
+
+![SDM predictions for Hyperiid Amphipods.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/hyperiid_amphipod_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Hyperiid Amphipods.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/hyperiid_amphipod_predict_SE_map.png){width=100%}
+
+#### Non-Cancer Crab Larvae
+
+![SDM predictions for Non-Cancer Crab Larvae.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/non_cancer_crab_larvae_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Non-Cancer Crab Larvae.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/non_cancer_crab_larvae_predict_SE_map.png){width=100%}
+
+#### Shrimp Larvae
+
+![SDM predictions for Shrimp Larvae.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/shrimp_larvae_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Shrimp Larvae.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/shrimp_larvae_predict_SE_map.png){width=100%}
+
+#### Sooty Shearwaters
+
+![SDM predictions for Sooty Shearwaters.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/sosh_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Sooty Shearwaters.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/sosh_predict_SE_map.png){width=100%}
+
+#### Common Murres
+
+![SDM predictions for Common Murres.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/comu_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Common Murres.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/comu_predict_SE_map.png){width=100%}
+
+#### YOY Rockfishes
+
+![SDM predictions for YOY Rockfishes (Sebastes spp.).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/rf_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for YOY Rockfishes (Sebastes spp.).](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/rf_predict_SE_map.png){width=100%}
+
+#### Pacific Hake
+
+![SDM predictions for Hake.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/hake_predict_map.png){width=100%}
+
+<br>
+
+![Standard error for SDM predictions for Hake.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/biomass_models/SDM_predict_maps/hake_predict_SE_map.png){width=100%}
+
+
+### 5 SDM-derived marine survival covariates
+
+![SDM-derived inputs for the survival model. Relative abundance indices for the study region (each time series is scaled relative to the maximum value in the time series) for each covariate taxon in the study region are shown in panel (A), the local index of collocation for the overlap between subyearling interior Fall Chinook Salmon and each of the predator or prey taxa is shown in panel (B), and the local index of collocation for the overlap between yearling interior Fall Chinook Salmon and each of the predator or prey taxa is shown in panel (C). Points are the maximum likelihood estimates for the value in each year while the bars show the 95% confidence interval.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/no_salmon_index_models/fig3_covariates_ts.png){width=100%}
+
+<br>
+
+The relative abundance of both the Bongo net aggregate prey field and the YOY rockfishes increased towards the end of the time series, driven by a handful of tows with very high catches of some of the component prey species (Supplemental Results 1). The abundance of Pacific Hake was less variable than that of the two seabirds, and the variance of the estimates was generally lower. Overlap between both subyearling and yearling Chinook Salmon was lowest with Pacific Hake, due to Pacific Hake having a more offshore distribution than juvenile Chinook Salmon (Supplemental Results 3). Overlap between both subyearling and yearling Chinook Salmon and the other four taxa (prey field, YOY rockfishes, Common Murres, and Sooty Shearwaters) was variable throughout the time series and was estimated with greater variance.
+
+### 6 Fit between latent state estimated in the survival model (stage two model) and the SDM-estimated value (stage one model) {.tabset .tabset-pills}
+
+#### Seabirds x Subyearlings
+
+![Fit to prey field index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_prey_field_index_eiv_plot.png){width=50%}
+
+<br>
+
+![Fit to prey field overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_prey_field_overlap_eiv_plot.png){width=50%}
+
+<br> 
+
+![Fit to YOY rockfishes index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_rf_index_eiv_plot.png){width=50%}
+
+<br>
+
+![Fit to YOY rockfishes overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_rf_overlap_eiv_plot.png){width=50%}
+
+<br> 
+
+![Fit to Sooty Shearwaters index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_sosh_index_eiv_plot.png){width=50%}
+
+<br>
+
+![Fit to Sooty Shearwaters overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_sosh_overlap_eiv_plot.png){width=50%}
+
+<br> 
+
+![Fit to Common Murres index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_comu_index_eiv_plot.png){width=50%}
+
+<br>
+
+![Fit to Common Murres overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_subyearlings/seabirds_cssif_comu_overlap_eiv_plot.png){width=50%}
+
+<br> 
+
+#### Seabirds x Yearlings
+
+![Fit to prey field index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_prey_field_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to prey field overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_prey_field_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  ![Fit to YOY rockfishes index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_rf_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to YOY rockfishes overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_rf_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  ![Fit to Sooty Shearwaters index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_sosh_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to Sooty Shearwaters overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_sosh_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  ![Fit to Common Murres index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_comu_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to Common Murres overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/seabirds_yearlings/seabirds_csyif_comu_overlap_eiv_plot.png){width=50%}
+
+<br> 
+
+#### Hake x Subyearlings
+
+![Fit to prey field index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_subyearlings/hake_cssif_prey_field_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to prey field overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_subyearlings/hake_cssif_prey_field_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  ![Fit to YOY rockfishes index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_subyearlings/hake_cssif_rf_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to YOY rockfishes overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_subyearlings/hake_cssif_rf_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  ![Fit to Hake index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_subyearlings/hake_cssif_hake_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to Hake overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_subyearlings/hake_cssif_hake_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  
+#### Hake x Yearlings
+  
+  ![Fit to prey field index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_yearlings/hake_csyif_prey_field_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to prey field overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_yearlings/hake_csyif_prey_field_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  ![Fit to YOY rockfishes index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_yearlings/hake_csyif_rf_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to YOY rockfishes overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_yearlings/hake_csyif_rf_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  ![Fit to Hake index. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_yearlings/hake_csyif_hake_index_eiv_plot.png){width=50%}
+
+<br>
+  
+  ![Fit to Hake overlap. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/eiv_fit_plots/hake_yearlings/hake_csyif_hake_overlap_eiv_plot.png){width=50%}
+
+<br> 
+  
+  
+### 7 No Errors-in-Variables Sensitivity Analysis
+
+![Figure 3 from the main text reproduced with a model where the SDM-derived marine survival covariates are treated as known, without the uncertainty accounted for using the errors-in-variables approach. Regression coefficients for the SDM-derived survival covariates in the survival models with seabirds as the focal predators (A, B) and Pacific Hake as the focal predator (C, D). In panels (A) and (C), the parameter estimates are shown for the effect of overlap with subyearling (0) interior Chinook Salmon; in panels (B) and (D), the parameter estimates are shown for the effect of overlap with yearling (1) interior Chinook Salmon. Regression coefficients are defined in Table 2. Points show the maximum likelihood estimates for each parameter, while the bars show the 95% confidence intervals. Parameters where the 95% confidence interval does not cross zero are shown in black and are interpreted as statistically significant.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/no_EiV_sensitivity/fig4_SAR_parameter_estimates_v2.png){width=100%}
+
+<br>
+
+### 8 Additional marine survival covariates
+
+
+<br>
+
+![Effect of stock group/transport status on marine survival.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/one_model/beta_group_param_estimates_plot.png){width=100%}
+
+<br>
+
+![Effect of outmigration timing (outmigration date and outmigration date^2), relative to mean outmigration date, for Snake River Fall and Upper Columbia Summer/Fall fish, relative to mean migration date. Note that this is relative to the mean migration date of the fish included in the model, and therefore does not include the later migrants for either stock.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/one_model/beta_outmigration_param_estimates_plot.png){width=80%}
+
+
+### 9 Model fitted values
+
+Model fitted values had consistently wide confidence intervals, although the Pacific Hake models were more precise than the seabird models. Confidence intervals were generally higher for years with higher marine survival.
+
+<br>
+
+![Empirical marine survival data (points) and predicted marine survival for each juvenile run year for Snake River Fall transported fish, with the maximum likelihood estimates shown as crossed circles and the 95% confidence intervals shown as bars. The predicted values for the four models are shown in panels A-D. Note that in many years, these confidence intervals extend beyond the plot boundaries.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/one_model/SRF_transported_SAR_model_predictions_comp_plot.png){width=100%}
+
+<br>
+
+![Empirical marine survival data (points) and predicted marine survival for each juvenile run year for Snake River Fall in-river fish, with the maximum likelihood estimates shown as crossed circles and the 95% confidence intervals shown as bars. The predicted values for the four models are shown in panels A-D. Note that in many years, these confidence intervals extend beyond the plot boundaries.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/one_model/SRF_non_transported_SAR_model_predictions_comp_plot.png){width=100%}
+
+<br>
+
+![Empirical marine survival data (points) and predicted marine survival for each juvenile run year for Upper Columbia Summer/Fall fish, with the maximum likelihood estimates shown as crossed circles and the 95% confidence intervals shown as bars. The predicted values for the four models are shown in panels A-D. Note that in many years, these confidence intervals extend beyond the plot boundaries.](/Users/markusmin/Documents/JSOES-SDM/figures/paper_figures/one_model/UCSF_SAR_model_predictions_comp_plot.png){width=100%}
+
+
+
+## References

@@ -1,0 +1,401 @@
+---
+title: "02.2_JSOES_bongo_biomass_data_processing"
+author: "Markus Min"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+#### Description
+
+This R Markdown processes the bongo_biomass biomass data from JSOES to prepare it for input into SDMs.
+
+
+
+## Load data and libraries; reformat data
+
+```{r load_libraries_load_reformat_data}
+library(readxl)
+library(here)
+library(janitor)
+library(tidyverse)
+library(kableExtra)
+library(sf)
+library(gstat)
+library(sp)
+library(ggthemes)
+library(ape)
+
+bongo_biomass <- clean_names(read_excel(here::here("Data", "Markus_Min_Plankton BM for Trophic Summary Query CalanusbyLength_10.2.24.xlsx")))
+
+# note that some taxa have zero biomass
+table(subset(bongo_biomass, sum_of_final_carbon_mg_m3 == 0)$genus_species)
+# they're mostly Cnidarians, but with some rare taxa. There are also some where 
+# it's a specific life history stage of an important taxon, btu where I assume
+# they're so small that the biomass is negligible.
+
+# We're going to replace the biomass of each of these with a functionally zero small number.
+bongo_biomass %>% 
+  mutate(sum_of_final_carbon_mg_m3 = ifelse(sum_of_final_carbon_mg_m3 == 0, 0.00001, sum_of_final_carbon_mg_m3)) -> bongo_biomass
+
+# there's one sample that's missing spatial data: 20 June   2004 062904NH30
+# filter(bongo_biomass, (is.na(dec_long)))
+
+jsoes <- clean_names(read_excel(here::here("Data", "Markus_Min_Trawl_CTD_Chl_Nuts_Thorson_Scheuerell_5.15.25_FINAL.xlsx")))
+# Keep only June data
+jsoes <- filter(jsoes, month == "June")
+
+# use the spatial information for the same tow from the trawl data to fix this
+bongo_biomass %>% 
+  mutate(dec_lat = ifelse(station_code == "062904NH30", subset(jsoes, station_code == "062904NH30")$mid_lat, dec_lat)) %>% 
+  mutate(dec_long = ifelse(station_code == "062904NH30", subset(jsoes, station_code == "062904NH30")$mid_long, dec_long)) -> bongo_biomass
+
+# turn this into an sf object
+st_as_sf(bongo_biomass, coords = c("dec_long", "dec_lat"), crs = 4326) -> bongo_biomass_sf
+
+# change CRS to UTM zone 10 (to work in meters)
+UTM_zone_10_crs <- 32610
+bongo_biomass_sf_proj <- sf::st_transform(bongo_biomass_sf, crs = UTM_zone_10_crs)
+
+# make this projection into kilometers to help with interpretability
+bongo_biomass_sf_proj_km <- st_as_sf(bongo_biomass_sf_proj$geometry/1000, crs = UTM_zone_10_crs)
+
+# extract geometry
+as.data.frame(st_coordinates(bongo_biomass_sf_proj_km)) -> bongo_biomass_km
+# add this back to bongo_biomass (X and Y now represent eastings and northings in km)
+bind_cols(bongo_biomass, bongo_biomass_km) -> bongo_biomass
+
+trophic_groupings <- clean_names(read_excel(here::here("Data", "Markus_Min_Trophic Groupings_10.2.24.xlsx")))
+
+# change genus species to be consistent across these two files, and usual 
+# latin name and common name capitalization
+bongo_biomass$genus_species <- str_to_sentence(bongo_biomass$genus_species)
+trophic_groupings$genus_species <- str_to_sentence(trophic_groupings$genus_species)
+trophic_groupings$common_name <- str_to_title(trophic_groupings$common_name)
+
+trophic_groupings %>% 
+  dplyr::select(genus_species, common_name) %>% 
+  filter(!(duplicated(genus_species))) -> common_name_df
+
+# get all unique tows
+bongo_biomass %>% 
+  mutate(sampleID = paste0(station, "_", sample_date)) %>% 
+  relocate(sampleID) %>% 
+  dplyr::select(-c(genus_species, life_history_stage, id_code, sum_of_final_carbon_mg_m3)) %>% 
+  filter(!(duplicated(sampleID))) -> bongo_biomass_tows
+
+# complete bongo_biomass data, so that we have zeros for each taxon in tows where they weren't caught
+bongo_biomass %>% 
+  mutate(sampleID = paste0(station, "_", sample_date)) %>% 
+  relocate(sampleID) %>% 
+  # drop tow information; we will add this back later
+  dplyr::select(-c(id_code, cruise_number, month, year, station_code, net_type, sample_date,
+                   sample_time, dec_lat, dec_long, station_depth_m, transect_name, station_number, 
+                   station, n_cr_s, day_night)) %>% 
+  complete(sampleID, 
+           nesting(genus_species, life_history_stage), 
+           fill = list(sum_of_final_carbon_mg_m3 = 0)) -> bongo_biomass_catch
+
+bongo_biomass_catch %>% 
+  left_join(bongo_biomass_tows, by = "sampleID") -> bongo_biomass_catch
+
+
+# add common name
+bongo_biomass_catch %>% left_join(common_name_df, by = "genus_species") -> bongo_biomass_catch
+
+# look into different life history stages
+
+
+# create a version of this where we collapse all life history stages together
+bongo_biomass_catch %>% 
+  dplyr::select(sampleID, genus_species, sum_of_final_carbon_mg_m3) %>% 
+  group_by(sampleID, genus_species) %>% 
+  summarise_if(is.numeric, sum) -> bongo_biomass_catch_LH_collapse
+
+bongo_biomass_catch_LH_collapse %>% 
+  left_join(bongo_biomass_tows, by = "sampleID") %>% 
+  ungroup() -> bongo_biomass_catch_LH_collapse
+```
+
+
+## Assign taxa into functional groups
+
+The JSOES bongo_biomass data contains data on both the direct prey of Pacific salmon as well as the prey items of the prey of Pacific salmon. The direct salmon prey that is caught in this survey includes Euphausiids, Cancer crab larvae, hyperiid amphipods, and non-cancer crab larvae. The abundance of copepods has also been correlated with salmon marine survival, and as such we will also examine these taxa.
+
+Here, we will assign individual species to broad taxonomic groups.
+
+```{r}
+# get count of each genus_species
+bongo_biomass_catch_LH_collapse %>% 
+  filter(sum_of_final_carbon_mg_m3 > 0) %>% 
+  count(genus_species) %>% 
+  arrange(desc(n)) %>% 
+  mutate(prop_samples = n/nrow(bongo_biomass_tows)) %>% 
+  left_join(common_name_df, by = "genus_species") %>% 
+  relocate(common_name, .after = "genus_species") -> bongo_biomass_freq_occ
+
+bongo_biomass_taxon_groups <- data.frame(genus_species = bongo_biomass_freq_occ$genus_species,
+                                 group = c(
+                                   "krill", "krill", "krill",
+                                   "cold-water copepods", "Cancer crab larvae", "Chaetognaths",
+                                   "Hyperiid amphipod", "Barnacle larvae", "sea butterflies",
+                                   "Crangon shrimp", "Hyperiid amphipod", "fish eggs",
+                                   "Caridean shrimp", "Cnidarians", "copepods",
+                                   "warm-water copepods", "rockfishes", "northern anchovy",
+                                   "ghost shrimp", "Non-Cancer crab larvae", "Cancer crab larvae",
+                                   "copepods", "Non-Cancer crab larvae", "Non-Cancer crab larvae",
+                                   "Gammarid amphipod", "Non-Cancer crab larvae", "Cnidarians",
+                                   "Cnidarians", "Cancer crab larvae", "Cnidarians",
+                                   "Barnacle larvae", "copepods", "Non-Cancer crab larvae",
+                                   "Cnidarians", "Hyperiid amphipod", "flatfishes",
+                                   "Polychaetes", "Caridean shrimp", "squat lobster",
+                                   "insects", "myctophids", "flatfishes",
+                                   "flatfishes", "sculpins", "flatfishes",
+                                   "Non-Cancer crab larvae", "fishes", "squids",
+                                   "Gammarid amphipod", "Osmerids", "Non-Cancer crab larvae",
+                                   "Hyperiid amphipod", "mysids", "Pacific Tomcod",
+                                   "Hyperiid amphipod", "sea butterflies", "sculpins",
+                                   "Non-Cancer crab larvae", "copepods", "flatfishes", 
+                                   "Non-Cancer crab larvae", "krill", "shrimp larvae",
+                                   "snailfishes", "insects", "ronquils/pricklebacks",
+                                   "sea butterflies", "Non-Cancer crab larvae", "snailfishes",
+                                   "snailfishes", "sculpins", "flatfishes", "salps",
+                                   "Hyperiid amphipod",  "salps",
+                                   
+                                   "snailfishes", "isopods", "goby",
+                                   "Hyperiid amphipod", "snailfishes", "Cnidarians",
+                                   
+                                   "rockfishes", "sculpins", "bivalves",
+                                   "Non-Cancer crab larvae", "insects", "myctophids",
+                                   "Gammarid amphipod", "insects", "mysids",
+                                   "flatfishes", "copepods", "insects",
+                                   "goby", "sculpins", "shrimp",
+                                   "Cnidarians", "sculpins", "mysids",
+                                   "mysids", "Hyperiid amphipod", "Non-Cancer crab larvae",
+                                   "Pacific sardine", "myctophids", "mysids",
+                                   "sculpins", "Cnidarians", "Caprellid amphipod",
+                                   "sculpins", "unknown decapod", "fishes",
+                                   "Non-Cancer crab larvae", "mysids", "Cnidarians",
+                                   "siphonophores", "insects", "Hyperiid amphipod",
+                                   "Cnidarians", "Cnidarians", "spiders",
+                                   "sea butterflies", "flatfishes", "fishes",
+                                   "flatfishes", "Cnidarians", "Non-Cancer crab larvae",
+                                   "sculpins", "Cnidarians", "fish eggs",
+                                   "insects", "sea lice", "Cancer crab larvae",
+                                   "sculpins", "Non-Cancer crab larvae", "Non-Cancer crab larvae", 
+                                   "sculpins", "flatfishes", "Polychaetes",
+                                   "isopods", "fishes", "insects",
+                                   "poachers", "poachers", "Pacific Sand Lance", "sculpins",
+                                    "Non-Cancer crab larvae", "copepods", "squids",
+                                   "Pacific Herring", "Corophiid amphipod", "Hyperiid amphipod",
+                                   "myctophids", "greenlings", "fishes",
+                                   "isopods", "isopods", "insects",
+                                   "sculpins", "Hyperiid amphipod", "Non-Cancer crab larvae", 
+                                   "Non-Cancer crab larvae", "flatfishes", "insects",
+                                   "Non-Cancer crab larvae", "pyrosomes", "Chaetognaths",
+                                   "Chaetognaths", "shrimp larvae", "poachers",
+                                   "isopods", "krill", "krill",
+                                   "Non-Cancer crab larvae", "amphipod", "ronquils/pricklebacks",
+                                   "fishes", "Cancer crab larvae", "copepods",
+                                   "fishes", "sculpins", "goby",
+                                   "sculpins", "sculpins", "shrimp larvae",
+                                   "Ctenophores", "shrimp larvae", "Tunicates",
+                                   "sculpins", "mysids", "fishes",
+                                   "fishes", "Hyperiid amphpids", "isopods",
+                                   "isopods", "myctophids", "shrimp larvae",
+                                   "fishes", "myctophids", "shrimp larvae",
+                                   "myctophids", "sculpins", "greenlings",
+                                   "Non-Cancer crab larvae", "shrimp larvae", "sea lice",
+                                   "Cnidarians", "fishes", "Non-Cancer crab larvae", 
+                                   "rockfishes", "rockfishes", "siphonophores",
+                                   "ronquils/pricklebacks", "Non-Cancer crab larvae", "krill",
+                                   "Hyperiid amphipod"
+                                 ))
+
+table(bongo_biomass_taxon_groups$group)
+
+# combine the shrimps together
+bongo_biomass_taxon_groups %>% 
+  mutate(group = ifelse(grepl("shrimp|mysids", group), "shrimp larvae", group)) -> bongo_biomass_taxon_groups
+
+# export this for later reference
+write.csv(bongo_biomass_taxon_groups, here::here("figures", "JSOES_bongo_biomass_functional_groups.csv"))
+
+# export a second version of this table that shows the relative densities
+bongo_biomass_catch %>% 
+  group_by(genus_species) %>% 
+  summarise(total = sum(sum_of_final_carbon_mg_m3)) %>% 
+  left_join(dplyr::select(bongo_biomass_freq_occ, genus_species, prop_samples), by = "genus_species") -> bongo_biomass_catch_summary
+
+bongo_biomass_catch_summary %>% 
+  left_join(bongo_biomass_taxon_groups, by = "genus_species") %>% 
+  group_by(group) %>% 
+  summarise(group_total = sum(total)) -> bongo_biomass_group_catch_summary
+
+bongo_biomass_catch_summary %>% 
+  left_join(bongo_biomass_taxon_groups, by = "genus_species") %>% 
+  left_join(bongo_biomass_group_catch_summary, by = "group") %>% 
+  mutate(prop_group_total = total/group_total) -> bongo_biomass_catch_summary
+
+# see what life history stages belong to each taxon
+bongo_biomass_catch %>% 
+  group_by(genus_species) %>% 
+  summarise(unique_life_history_stages = unique(life_history_stage)) -> lh_stages_by_genus_species
+
+# drop the adult stages
+lh_stages_by_genus_species <- lh_stages_by_genus_species[!(grepl("adult", lh_stages_by_genus_species$unique_life_history_stages, ignore.case = TRUE)),]
+
+lh_stages_list <- data.frame(genus_species = unique(lh_stages_by_genus_species$genus_species),
+                             life_history_stages = NA)
+
+for (i in 1:length(unique(lh_stages_by_genus_species$genus_species))){
+  lh_stages_list$life_history_stages[i] <- paste(subset(lh_stages_by_genus_species, genus_species == unique(lh_stages_by_genus_species$genus_species)[i])$unique_life_history_stages,collapse = ", ")
+}
+
+bongo_biomass_catch_summary %>% 
+  left_join(lh_stages_list, by = "genus_species") %>% 
+  filter(!is.na(life_history_stages)) -> bongo_biomass_catch_summary
+
+write.csv(bongo_biomass_catch_summary, here::here("figures", "paper_figures", "JSOES_bongo_biomass_functional_groups_summary.csv"))
+
+
+# add the groupings to our data
+bongo_biomass_catch %>% 
+  left_join(bongo_biomass_taxon_groups, by = "genus_species") -> bongo_biomass_catch_groups
+
+bongo_biomass_catch_LH_collapse %>% 
+  left_join(bongo_biomass_taxon_groups, by = "genus_species") -> bongo_biomass_catch_LH_collapse
+
+```
+
+## investigate functional groups
+```{r}
+bongo_biomass_catch %>% 
+  left_join(bongo_biomass_taxon_groups, by = "genus_species") -> bongo_biomass_catch_taxonomy
+
+# shrimp larvae
+bongo_biomass_catch_taxonomy %>% 
+  subset(group == "shrimp larvae") %>% 
+  group_by(life_history_stage) %>% 
+  summarise(total = sum(sum_of_final_carbon_mg_m3)) %>% 
+  arrange(desc(total))
+# Yes, this is all larval/juvenile stages (only two adult shrimp in the whol dataset)
+
+# Non-cancer crab larvae
+bongo_biomass_catch_taxonomy %>% 
+  subset(group == "Non-Cancer crab larvae") %>% 
+  group_by(life_history_stage) %>% 
+  summarise(total = sum(sum_of_final_carbon_mg_m3)) %>% 
+  arrange(desc(total))
+# One single adult hermit crab, which may be functionally similar to crab larvae
+
+# Cancer crab larvae
+bongo_biomass_catch_taxonomy %>% 
+  subset(group == "Cancer crab larvae") %>% 
+  group_by(life_history_stage) %>% 
+  summarise(total = sum(sum_of_final_carbon_mg_m3)) %>% 
+  arrange(desc(total))
+# all larval/juvenile stages
+
+# Hyperiid amphipods
+bongo_biomass_catch_taxonomy %>% 
+  subset(group == "Hyperiid amphipod") %>% 
+  group_by(life_history_stage) %>% 
+  summarise(total = sum(sum_of_final_carbon_mg_m3)) %>% 
+  arrange(desc(total))
+# majority are juveniles
+
+# what about fishes?
+bongo_biomass_catch_taxonomy %>% 
+  subset(group %in% c("fishes", "flatfishes", "myctophids", "sculpins", "rockfishes")) %>% 
+  group_by(life_history_stage) %>% 
+  summarise(total = sum(sum_of_final_carbon_mg_m3)) %>% 
+  arrange(desc(total))
+
+# these are almost all larval and egg stages - not direct prey of salmon. So we won't look into them.
+```
+
+
+## Export data
+
+In the last section of this script, we will export the following functional groups for inclusion in spatiotemporal models. The data will be formatted as the total density of each functional group at each station.
+
+- Cancer crab larvae
+- Non-cancer crab larvae
+- shrimp larvae
+- Hyperiid amphipods
+
+```{r}
+export_group_data <- function(data, group_name, drop_life_history_stages, export_path){
+    # keep only this taxon
+  group_data <- subset(data, group == group_name)
+  
+  # drop certain life history stages
+  group_data <- subset(group_data, !(life_history_stage %in% drop_life_history_stages))
+  
+  # now, collapse life history stages together
+  group_data %>% 
+    dplyr::select(sampleID, genus_species, sum_of_final_carbon_mg_m3) %>% 
+    group_by(sampleID, genus_species) %>% 
+    summarise_if(is.numeric, sum) %>% 
+    left_join(bongo_biomass_tows, by = "sampleID") %>% 
+    ungroup() -> group_data
+  
+  # collapse across groups
+  group_data %>%
+    group_by(across(c(-genus_species, -sum_of_final_carbon_mg_m3))) %>%
+    summarise(total_sum_of_final_carbon_mg_m3 = sum(sum_of_final_carbon_mg_m3)) -> group_data
+
+  write.csv(group_data, export_path, row.names = FALSE)
+}
+
+unique(subset(bongo_biomass_catch_groups, group == "Cancer crab larvae")$life_history_stage)
+export_group_data(data = bongo_biomass_catch_groups, group_name = "Cancer crab larvae",
+                  drop_life_history_stages = "Adult",
+                  export_path = here::here("model_inputs", "jsoes_bongo_biomass_cancer_crab_larvae.csv"))
+
+unique(subset(bongo_biomass_catch_groups, group == "Non-Cancer crab larvae")$life_history_stage)
+export_group_data(data = bongo_biomass_catch_groups, group_name = "Non-Cancer crab larvae",
+                  drop_life_history_stages = "Adult",
+                  export_path = here::here("model_inputs", "jsoes_bongo_biomass_non_cancer_crab_larvae.csv"))
+
+unique(subset(bongo_biomass_catch_groups, group == "shrimp larvae")$life_history_stage)
+export_group_data(data = bongo_biomass_catch_groups, group_name = "shrimp larvae",
+                  drop_life_history_stages = "Adult",
+                  export_path = here::here("model_inputs", "jsoes_bongo_biomass_shrimp_larvae.csv"))
+
+unique(subset(bongo_biomass_catch_groups, group == "Hyperiid amphipod")$life_history_stage)
+export_group_data(data = bongo_biomass_catch_groups, group_name = "Hyperiid amphipod",
+                  drop_life_history_stages = NULL,
+                  export_path = here::here("model_inputs", "jsoes_bongo_biomass_hyperiid_amphipod.csv"))
+```
+
+
+#### Compare the biomass with the density data
+
+```{r}
+# load the density data
+cancer_crab_larvae_density <- read.csv(here::here("model_inputs", "jsoes_bongo_cancer_crab_larvae.csv"))
+non_cancer_crab_larvae_density <- read.csv(here::here("model_inputs", "jsoes_bongo_non_cancer_crab_larvae.csv"))
+shrimp_larvae_density <- read.csv(here::here("model_inputs", "jsoes_bongo_shrimp_larvae.csv"))
+hyperiid_amphipod_density <- read.csv(here::here("model_inputs", "jsoes_bongo_hyperiid_amphipod.csv"))
+
+# load the biomass density
+cancer_crab_larvae_biomass <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_cancer_crab_larvae.csv"))
+non_cancer_crab_larvae_biomass <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_non_cancer_crab_larvae.csv"))
+shrimp_larvae_biomass <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_shrimp_larvae.csv"))
+hyperiid_amphipod_biomass <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_hyperiid_amphipod.csv"))
+
+plot(x = cancer_crab_larvae_density$total_sum_of_density_number_m3, y = cancer_crab_larvae_biomass$total_sum_of_final_carbon_mg_m3)
+cor(cancer_crab_larvae_density$total_sum_of_density_number_m3, cancer_crab_larvae_biomass$total_sum_of_final_carbon_mg_m3)
+plot(x = non_cancer_crab_larvae_density$total_sum_of_density_number_m3, y = non_cancer_crab_larvae_biomass$total_sum_of_final_carbon_mg_m3)
+cor(non_cancer_crab_larvae_density$total_sum_of_density_number_m3, non_cancer_crab_larvae_biomass$total_sum_of_final_carbon_mg_m3)
+plot(x = shrimp_larvae_density$total_sum_of_density_number_m3, y = shrimp_larvae_biomass$total_sum_of_final_carbon_mg_m3)
+cor(shrimp_larvae_density$total_sum_of_density_number_m3, shrimp_larvae_biomass$total_sum_of_final_carbon_mg_m3)
+plot(x = hyperiid_amphipod_density$total_sum_of_density_number_m3, y = hyperiid_amphipod_biomass$total_sum_of_final_carbon_mg_m3)
+cor(hyperiid_amphipod_density$total_sum_of_density_number_m3, hyperiid_amphipod_biomass$total_sum_of_final_carbon_mg_m3)
+```
+
+Biomass and density are extremely correlated (>0.98) for Cancer crab larvae and shrimp larvae, highly correlated for non-Cancer crab larvae (0.80), and somewhat correlated for hyperiid amphipods (0.54).
+
+
+
