@@ -1,0 +1,447 @@
+---
+title: "05.1.2_fit_rf_SDM"
+author: "Markus Min"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+This document fits the 05.1.1_fit_jsoes_bongo_biomass_model, which incorporates the following data sources:
+
+1. PRS/PWCC rockfish data
+2. JSOES trawl data (for yearling and subyearling Interior Chinook)
+
+
+
+```{r load_libraries_source_scripts, include = FALSE}
+library(tidyverse)
+library(here)
+library(TMB)
+library(ggforce)
+library(sdmTMB)
+library(kableExtra)
+library(fmesher)
+library(ggrepel)
+library(mgcv)
+library(sf)
+
+# knitr::opts_chunk()
+
+# source the function scripts
+source("R/functions/cAIC.R")
+source("R/functions/rmvnorm_prec.R")
+source("R/functions/sample_var.R")
+source("R/functions/plot_anisotropy_MM.R")
+source("R/functions/make_anisotropy_spde.R")
+source("R/functions/H_matrix_prior_predictive_check_for_ggplot.R")
+source("R/functions/plot_distribution.R")
+source("R/functions/plot_distribution_PRS_PWCC.R")
+source("R/functions/plot_distribution_jsoes_bongo.R")
+# source("R/functions/plot_distribution_hake_survey.R")
+source("R/functions/generate_prediction_maps.R")
+source("R/functions/generate_prediction_maps_PRS_PWCC.R")
+source("R/functions/generate_prediction_maps_jsoes_bongo.R")
+source("R/functions/generate_prediction_maps_hake_survey.R")
+source("R/functions/generate_prediction_maps_cces.R")
+source("R/functions/stage2_helper_functions.R")
+source("R/functions/sdmTMB_smoothing_functions.R")
+
+# source the prep scripts for each of the surveys
+source(here::here("R", "PRS_PWCC_make_mesh.R"))
+source(here::here("R", "JSOES_make_mesh.R"))
+```
+
+## Prepare survey data for SDMs
+
+#### CSYIF + CSSIF (JSOES Trawl)
+```{r csyif_cssif_data_prep}
+
+#### prep model data ####
+
+# extract Yearling Interior Chinook
+csyif <- subset(jsoes_long, species == "chinook_salmon_yearling_interior_fa")
+# extract subyearling Interior Chinook
+cssif <- subset(jsoes_long, species == "chinook_salmon_subyearling_interior_fa")
+
+#### Create SPDE objects ####
+
+# there are multiple meshes that are created in JSOES_make_mesh.R
+# here, we will use the cutoff 15 mesh, although a higher resolution is likely going
+# to improve results (at the cost of run time)
+
+trawl_spde <- fm_fem( inla_mesh_cutoff15, 
+                      order = 2 )
+
+# create projection matrix from vertices to samples
+trawl_is = fm_evaluator(inla_mesh_cutoff15, loc = as.matrix(data.frame(X = csyif$X, Y = csyif$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+trawl_gs = fm_evaluator( inla_mesh_cutoff15, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_trawl <- make_anisotropy_spde( inla_mesh_cutoff15 )
+```
+
+
+#### Rockfishes (PWCC/PRS)
+
+```{r}
+# make sure rf density is numeric not integer
+rf$total <- as.numeric(rf$total)
+
+#### Create SPDE objects ####
+
+# there are multiple meshes that are created in JSOES_make_mesh.R
+# here, we will use the cutoff 15 mesh, although a higher resolution is likely going
+# to improve results (at the cost of run time)
+
+PRS_PWCC_spde <- fm_fem( inla_mesh_cutoff15_jsoes_domain, 
+                order = 2 )
+
+# create projection matrix from vertices to samples
+A_is_rf = fm_evaluator(inla_mesh_cutoff15_jsoes_domain, loc = as.matrix(data.frame(X = rf$X, Y = rf$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+# use the prediction grid for only the JSOES domain here
+
+#### Create a survey prediction grid 
+# Create a survey grid from scratch, using SST data
+
+# only keep one year, since that's all we need to make a grid
+SST_sf_proj %>% 
+  filter(year == 2000) -> SST_sf_proj_2000
+
+st_as_sf(SST_sf_proj_2000$geometry/1000, crs = UTM_zone_10_crs) -> SST_sf_proj_km_2000
+
+SST_sf_proj_km_2000$dist_shore <- as.numeric(st_distance(SST_sf_proj_km_2000, US_west_coast_proj_km))
+
+
+# KEY DECISION: To what area do you want to project the SDM to?
+# Some observations of the data:
+# The vast majority of stations are within 60 km of shore, but there are just a couple 
+# that are further out in the Columbia River Plume up to 83 km from shore
+# a total of 15 tows (out of over 2000) are >= 35 nmi (65 km) offshore; many more are 30 or 31 nmi (55.5 or 57.4 km) offshore.
+# We also want to exclude values that are within 0.5 km of shore, because these
+# don't have measureable SST values (they're basically on shore)
+# this can also be seen in the following histogram:
+# hist(jsoes_long$km_from_shore)
+
+# For the N/S dimension, the most northerly transect is typically the FS transect and 
+# the most southerly transect is the NH transect.
+# this corresponds to 44.67 to 48.23 N
+# Let's take these as our N/S boundaries and add 10 km as a buffer.
+min_Y <- mean(subset(jsoes_long, grepl("NH", station))$Y)
+max_Y <- mean(subset(jsoes_long, grepl("FS", station))$Y)
+
+# Based on this, I'm going to propose that we generate a prediction that extends:
+# from 0.5 to 65 km offshore
+# from 44.67 to 48.23 N (+ 10 km on either side)
+
+# trim longitudinally
+SST_sf_proj_km_2000 %>% 
+  filter(dist_shore <= 65 & dist_shore >= 0.5) -> grid_within_65km_shore
+
+# trim latitudinally
+survey_domain <- st_crop(grid_within_65km_shore, xmin = 0, xmax = 100000, ymin=min_Y-10, ymax=max_Y+10)
+
+# let's inspect the grid that we created
+# ggplot(survey_domain) +
+#   geom_sf()
+
+# We will need to manually trim out some of these areas
+
+# manually remove sections for strait, hood canal (and other inland waters), Grays Harbor, Willapa Bay, Columbia River estuary
+strait <- st_as_sfc(st_bbox(c(xmin=-124.65, xmax=-122, ymin=47.9375, ymax=49), crs = "WGS84"))
+strait_proj <- sf::st_transform(strait, crs = UTM_zone_10_crs)
+strait_proj_km <- st_as_sf(strait_proj/1000, crs = UTM_zone_10_crs)
+
+inland_waters <- st_as_sfc(st_bbox(c(xmin=-123.5, xmax=-120, ymin=44, ymax=49.5), crs = "WGS84"))
+inland_waters_proj <- sf::st_transform(inland_waters, crs = UTM_zone_10_crs)
+inland_waters_proj_km <- st_as_sf(inland_waters_proj/1000, crs = UTM_zone_10_crs)
+
+grays_harbor <- st_as_sfc(st_bbox(c(xmin=-124.15, xmax=-123.6, ymin=46.83, ymax=47.09), crs = "WGS84"))
+grays_harbor_proj <- sf::st_transform(grays_harbor, crs = UTM_zone_10_crs)
+grays_harbor_proj_km <- st_as_sf(grays_harbor_proj/1000, crs = UTM_zone_10_crs)
+
+willapa_bay <- st_as_sfc(st_bbox(c(xmin=-124.06, xmax=-123.5, ymin=46.34, ymax=46.8), crs = "WGS84"))
+willapa_bay_proj <- sf::st_transform(willapa_bay, crs = UTM_zone_10_crs)
+willapa_bay_proj_km <- st_as_sf(willapa_bay_proj/1000, crs = UTM_zone_10_crs)
+
+estuary <- st_as_sfc(st_bbox(c(xmin=-124.02, xmax=-123.5, ymin=46.12, ymax=46.35), crs = "WGS84"))
+estuary_proj <- sf::st_transform(estuary, crs = UTM_zone_10_crs)
+estuary_proj_km <- st_as_sf(estuary_proj/1000, crs = UTM_zone_10_crs)
+
+survey_domain %>% 
+  st_difference(., strait_proj_km) %>% 
+  st_difference(., inland_waters_proj_km) %>% 
+  st_difference(., grays_harbor_proj_km) %>% 
+  st_difference(., willapa_bay_proj_km) %>% 
+  st_difference(., estuary_proj_km) -> survey_domain
+
+# Create a concave hull around points
+st_concave_hull(st_union(survey_domain), ratio = 0.1) -> survey_domain_polygon
+
+# ggplot(survey_domain_polygon) +
+#   geom_sf()
+
+# ggplot(survey_domain) +
+#   geom_sf()
+
+# let's inspect our revised survey domain
+survey_area_basemap_km +
+  geom_sf(data = survey_domain_polygon, fill = "blue", alpha = 0.2)
+
+# Take SST grid and intersect with survey domain
+SST_sf_proj %>% 
+  mutate(geometry = geometry/1000) %>% 
+  st_set_crs(UTM_zone_10_crs) %>% 
+  st_intersection(survey_domain_polygon) %>% 
+  dplyr::select(SST, year, geometry)-> SST_survey_domain
+
+survey_area_basemap_km +
+  geom_sf(data = SST_survey_domain, fill = "blue", alpha = 0.2)
+
+# add in distance from shore - this is now your survey domain, with covariates
+SST_survey_domain %>% 
+  mutate(sf_dist_shore = as.numeric(st_distance(geometry, US_west_coast_proj_km))) -> survey_domain_cov
+survey_domain_cov <- st_as_sf(survey_domain_cov, coords = c("X", "Y"), crs = UTM_zone_10_crs)
+
+
+
+# because the survey_domain_polygon is constructed from a concave hull, some of the borders
+# are a little coarse - and as a result some of the super nearshore data snuck back it.
+# filter it out
+survey_domain_cov %>% 
+  filter(sf_dist_shore >= 0.5) -> survey_domain_cov
+
+
+# extract the grid for the projection area - the grid dimensions are the same each year, so just select one year and drop fields besides geometry
+survey_domain_cov %>% 
+  filter(year == 2016) %>% 
+  dplyr::select(geometry) -> survey_domain_cov_grid
+
+A_gs_rf = fm_evaluator( inla_mesh_cutoff15_jsoes_domain, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+# A_gs_rf = fm_evaluator( inla_mesh_cutoff15_jsoes_domain, loc=st_coordinates(survey_domain_jsoes_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_rf <- make_anisotropy_spde( inla_mesh_cutoff15_jsoes_domain )
+```
+
+# Data visualizations
+
+Export the mesh and projection grid for the supplemental figures
+```{r export_mesh_figures}
+#### JSOES Midwater Trawl ####
+
+# transform mesh to sf
+fm_as_sfc(inla_mesh_cutoff15) %>% 
+  st_set_crs(st_crs(UTM_zone_10_crs)) -> inla_mesh_cutoff15_sf
+
+JSOES_trawl_mesh_plot <- survey_area_basemap_km +
+  geom_point(data = subset(survey_predict_grid, year == 2017), aes(x = X, y = Y), color = "gray50", alpha = 0.25) +
+  geom_sf(data = inla_mesh_cutoff15_sf, fill = NA, color = "black") +
+  geom_point(data = csyif, aes(x = X, y = Y), color = "white",fill = "red", shape = 24, size = 3)
+
+ggsave(here::here("figures", "paper_figures", "mesh_figures", "JSOES_trawl_mesh_plot.png"), JSOES_trawl_mesh_plot,  height = 8, width = 4)
+
+
+#### PRS/PWCCC ####
+fm_as_sfc(inla_mesh_cutoff15_jsoes_domain) %>% 
+  st_set_crs(st_crs(UTM_zone_10_crs)) -> inla_mesh_cutoff15_jsoes_domain_sf
+
+PRS_PWCC_mesh_plot <- survey_area_basemap_km_PRS_PWCC +
+  geom_sf(data = inla_mesh_cutoff15_jsoes_domain_sf, fill = NA, color = "black") +
+  geom_point(data = subset(survey_predict_grid, year == 2017), aes(x = X, y = Y), color = "gray50", alpha = 0.25) +
+  geom_point(data = rf, aes(x = X, y = Y), color = "white",fill = "red", shape = 24, size = 3)
+
+ggsave(here::here("figures", "paper_figures", "mesh_figures", "PRS_PWCC_mesh_plot.png"), PRS_PWCC_mesh_plot,  height = 16, width = 4)
+
+```
+
+Export plots of survey data
+```{r plot_distribtion}
+#### JSOES Midwater Trawls ####
+csyif_june_dist_plot <- plot_distribution(data = csyif, taxon_name = "Yearling Interior Fall Chinook")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "csyif_june_dist_plot.png"), csyif_june_dist_plot,  
+       height = 10, width = 12)
+
+cssif_june_dist_plot <- plot_distribution(data = cssif, taxon_name = "Subyearling Interior Fall Chinook")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "cssif_june_dist_plot.png"), cssif_june_dist_plot,  
+       height = 10, width = 12)
+
+#### PRS/PWCCC ####
+rf_dist_plot <- plot_distribution_PRS_PWCC(data = rf, taxon_name = "Sebastes spp.")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "rf_dist_plot.png"), rf_dist_plot,  
+       height = 10, width = 12)
+```
+
+
+# Fit SDM
+
+```{r SDM_inputs_prep}
+# create covariate grids for projections
+# generate the projection vector/matrix for covariates - this relies
+# on the survey prediction grid from the JSOES_make_mesh.R script
+
+distance_projection_vector <- as.numeric(filter(survey_predict_grid, year == 2000)$dist_shore_scaled)
+
+# for SST - take prediction grid, drop salinity, add SST with locations as rows and years as column
+survey_predict_grid %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, sal, sal_scaled, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix
+
+
+common_years_prey_field_model <- intersect(unique(csyif$year), # jsoes trawl
+                          unique(rf$year) # PRS/PWCC
+                          )
+
+# CSYIF
+# nothing additional required
+
+# CSSIS
+# smoothers
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm_cssif <- parse_smoothers(formula = "n_per_km ~ s(dist_shore_scaled)", data = as.data.frame(cssif), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid_cssif <- data.frame(SST_scaled = as.vector(temperature_projection_matrix),
+                           dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix)))
+
+sm_predict_cssif <- parse_smoothers(formula = "n_per_km ~ s(dist_shore_scaled)", data = as.data.frame(cssif), knots = NULL,
+                              newdata = predict_grid_cssif, basis_prev = sm_cssif$basis_out)
+
+# rf
+# nothing additional required
+
+```
+
+
+```{r}
+# save.image(here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "05.1.2_rf_SDM.rda"))
+# load(here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "05.1.2_rf_SDM.rda"))
+
+compile(here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "05_1_2_rf_SDM.cpp"))
+dyn.load(dynlib(here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "05_1_2_rf_SDM")))
+
+rf_SDM_Data = list(
+  ## time series lengths
+  "n_t_jsoes" = length(unique(csyif$year)),
+  "n_t_rf" = length(unique(rf$year)),
+  "n_t_shared" = length(common_years_prey_field_model),
+  # the indices of the different data sources in the common years
+  "t_rf_indices" = match(common_years_prey_field_model, unique(rf$year))-1,
+  "t_jsoes_indices" = match(common_years_prey_field_model, unique(csyif$year))-1,
+  
+  # temperature and distance projection matrices
+  "temp_gt" = temperature_projection_matrix,
+  "dist_g" = distance_projection_vector,
+  
+  ## csyif data
+  "weights_i_csyif" = rep(1, length(csyif$n_per_km)), # weights (all 1)
+  "D_i_csyif"= csyif$n_per_km/max(csyif$n_per_km)*1000, "t_i_csyif" =  csyif$year - min(csyif$year),
+  "A_is_csyif"=trawl_is, "A_gs_csyif"=trawl_gs, # "M0_b"=trawl_spde$c0, "M1_b"=trawl_spde$g1, "M2_b"=trawl_spde$g2,
+  "spatial_list_csyif" = spatial_list_trawl,
+  "temp_i_csyif" = csyif$SST_scaled,
+  
+  ## cssif data
+  "weights_i_cssif" = rep(1, length(cssif$n_per_km)), # weights (all 1)
+  "D_i_cssif"= cssif$n_per_km/max(cssif$n_per_km)*1000,
+  "t_i_cssif" = cssif$year - min(cssif$year),
+  "A_is_cssif"=trawl_is, "A_gs_cssif"=trawl_gs, # "M0_b"=trawl_spde$c0, "M1_b"=trawl_spde$g1, "M2_b"=trawl_spde$g2,
+  "spatial_list_cssif" = spatial_list_trawl,
+  "temp_i_cssif" = cssif$SST_scaled,
+  "dist_i_cssif" = cssif$dist_shore_scaled,
+  # cssif smooth function data
+  "Zs_cssif" = sm_cssif$Zs, # smoother basis function matrices
+  "Xs_cssif" = sm_cssif$Xs, # smoother linear effect matrix
+  "b_smooth_start_cssif" = sm_cssif$b_smooth_start,
+  "proj_Zs_cssif" = sm_predict_cssif$Zs,
+  "proj_Xs_cssif" = sm_predict_cssif$Xs,
+  
+    ## rf data
+  "weights_i_rf" = rep(1, length(rf$total)), # weights (all 1)
+  "D_i_rf"= rf$total/max(rf$total)*1000,
+  # note that there are missing years of data - so this just represents the order of years (but there are gaps!)
+  "t_i_rf" = as.integer(dplyr::dense_rank(rf$year - min(rf$year))-1),
+  "A_is_rf"=A_is_rf, "A_gs_rf"=A_gs_rf,
+  "spatial_list_rf" = spatial_list_rf
+)
+
+
+rf_SDM_Params <- list(
+  
+  ## csyif fixed effects
+  "beta_temp_csyif" = 0,
+  "ln_tau_omega_csyif"=0,  "ln_tau_epsilon_csyif"=0,
+  "ln_kappa_csyif"=0, "ln_phi_csyif" = 0,
+  "ln_H_input_csyif" = c(0, 0),
+  "finv_power_csyif" = 0,
+  
+  "logit_rhoE_csyif" = 0,
+  
+  # csyif random effects
+  "omega_s_csyif"=rnorm(nrow(trawl_spde$c0)),
+  "epsilon_st_csyif"=matrix(0, nrow=nrow(trawl_spde$c0), ncol=rf_SDM_Data$n_t_jsoes),
+  
+  ## cssif fixed effects
+  "beta_temp_cssif" = 0,
+  "ln_tau_epsilon_cssif"=0,
+  "ln_tau_omega_cssif"=0, 
+  "ln_kappa_cssif"=0,
+  "ln_phi_cssif" = 0,
+  "ln_H_input_cssif" = c(0, 0),
+  "finv_power_cssif" = 0,
+  
+  # "logit_rhoE_cssif" = 0,
+  
+  # cssif random effects
+  "omega_s_cssif"=rnorm(nrow(trawl_spde$c0)),
+  "epsilon_st_cssif"=matrix(0, nrow=nrow(trawl_spde$c0), ncol=rf_SDM_Data$n_t_jsoes),
+  
+  # cssif smooth functions
+  "bs_cssif" = rep(0, ncol(sm_cssif$Xs)),
+  "b_smooth_cssif" = rep(0, sum(sm_cssif$sm_dims)),
+  "ln_smooth_sigma_cssif" = rep(0, length(sm_cssif$sm_dims)),
+  
+  
+  ## rf fixed effects
+  "ln_tau_omega_rf"=0,  "ln_tau_epsilon_rf"=0,
+  "ln_kappa_rf"=0, "ln_phi_rf" = 0,
+  "ln_H_input_rf" = c(0, 0),
+  "finv_power_rf" = 0,
+  
+  # rf random effects
+  "omega_s_rf"=rnorm(nrow(PRS_PWCC_spde$c0)),
+  "epsilon_st_rf"=matrix(0, nrow=nrow(PRS_PWCC_spde$c0), ncol=rf_SDM_Data$n_t_rf)
+  
+)
+
+rf_SDM_Obj = MakeADFun( data=rf_SDM_Data,
+                                                parameters=rf_SDM_Params,
+                                                random= c("omega_s_csyif", "epsilon_st_csyif",
+                                                          "omega_s_cssif", "epsilon_st_cssif", "b_smooth_cssif",
+                                                          "omega_s_rf", "epsilon_st_rf"),
+                                                DLL = "05_1_2_rf_SDM")
+
+# Optimize
+rf_SDM_Opt = nlminb( start=rf_SDM_Obj$par, obj=rf_SDM_Obj$fn, grad=rf_SDM_Obj$gr )
+# add getJointPrecision for index
+rf_SDM_Opt$SD = sdreport( rf_SDM_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+rf_SDM_report = rf_SDM_Obj$report()
+
+rf_SDM_output <- list(rf_SDM_Obj = rf_SDM_Obj,
+                                              rf_SDM_Opt = rf_SDM_Opt,
+                                              rf_SDM_report = rf_SDM_report)
+
+save(rf_SDM_output,
+     file = here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "rf_SDM_output.rda"))
+
+```

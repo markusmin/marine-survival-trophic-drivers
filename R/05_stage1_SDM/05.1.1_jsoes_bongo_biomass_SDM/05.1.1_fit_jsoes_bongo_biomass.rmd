@@ -1,0 +1,699 @@
+---
+title: "05.1.1_fit_jsoes_bongo_biomass"
+author: "Markus Min"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+This document fits the 05.1.1_fit_jsoes_bongo_biomass_model, which incorporates the following data sources:
+
+1. JSOES Bongo data (as biomass)
+2. JSOES trawl data (for yearling and subyearling Interior Chinook)
+
+
+
+```{r load_libraries_source_scripts, include = FALSE}
+library(tidyverse)
+library(here)
+library(TMB)
+library(ggforce)
+library(sdmTMB)
+library(kableExtra)
+library(fmesher)
+library(ggrepel)
+library(mgcv)
+library(sf)
+
+# knitr::opts_chunk()
+
+# source the function scripts
+source("R/functions/cAIC.R")
+source("R/functions/rmvnorm_prec.R")
+source("R/functions/sample_var.R")
+source("R/functions/plot_anisotropy_MM.R")
+source("R/functions/make_anisotropy_spde.R")
+source("R/functions/H_matrix_prior_predictive_check_for_ggplot.R")
+source("R/functions/plot_distribution.R")
+source("R/functions/plot_distribution_PRS_PWCC.R")
+source("R/functions/plot_distribution_jsoes_bongo.R")
+# source("R/functions/plot_distribution_hake_survey.R")
+source("R/functions/generate_prediction_maps.R")
+source("R/functions/generate_prediction_maps_PRS_PWCC.R")
+source("R/functions/generate_prediction_maps_jsoes_bongo.R")
+source("R/functions/generate_prediction_maps_hake_survey.R")
+source("R/functions/generate_prediction_maps_cces.R")
+source("R/functions/stage2_helper_functions.R")
+source("R/functions/sdmTMB_smoothing_functions.R")
+
+# source the prep scripts for each of the surveys
+source(here::here("R", "PRS_PWCC_make_mesh.R"))
+source(here::here("R", "JSOES_make_mesh.R"))
+```
+
+## Prepare survey data for SDMs
+
+#### CSYIF + CSSIF (JSOES Trawl)
+```{r csyif_cssif_data_prep}
+
+#### prep model data ####
+
+# extract Yearling Interior Chinook
+csyif <- subset(jsoes_long, species == "chinook_salmon_yearling_interior_fa")
+# extract subyearling Interior Chinook
+cssif <- subset(jsoes_long, species == "chinook_salmon_subyearling_interior_fa")
+
+#### Create SPDE objects ####
+
+# there are multiple meshes that are created in JSOES_make_mesh.R
+# here, we will use the cutoff 15 mesh, although a higher resolution is likely going
+# to improve results (at the cost of run time)
+
+trawl_spde <- fm_fem( inla_mesh_cutoff15, 
+                      order = 2 )
+
+# create projection matrix from vertices to samples
+trawl_is = fm_evaluator(inla_mesh_cutoff15, loc = as.matrix(data.frame(X = csyif$X, Y = csyif$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+trawl_gs = fm_evaluator( inla_mesh_cutoff15, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_trawl <- make_anisotropy_spde( inla_mesh_cutoff15 )
+```
+
+
+#### Shrimp Larvae, Non-Cancer Crab Larvae, Crab Larvae, Hyperiid Amphipods (JSOES Bongo)
+
+```{r data_prep}
+#### load and reformat bongo data ####
+
+jsoes_bongo_biomass_cancer_crab_larvae <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_cancer_crab_larvae.csv"))
+jsoes_bongo_biomass_hyperiid_amphipods <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_hyperiid_amphipod.csv"))
+jsoes_bongo_biomass_non_cancer_crab_larvae <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_non_cancer_crab_larvae.csv"))
+jsoes_bongo_biomass_shrimp_larvae <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_shrimp_larvae.csv"))
+
+# drop 1998 (bongo doesn't have this year) and 2022:2025 (adult returns aren't complete for those years yet)
+jsoes_bongo_biomass_cancer_crab_larvae <- subset(jsoes_bongo_biomass_cancer_crab_larvae, !(year %in% c(1998, 2022:2025)))
+jsoes_bongo_biomass_hyperiid_amphipods <- subset(jsoes_bongo_biomass_hyperiid_amphipods, !(year %in% c(1998, 2022:2025)))
+jsoes_bongo_biomass_non_cancer_crab_larvae <- subset(jsoes_bongo_biomass_non_cancer_crab_larvae, !(year %in% c(1998, 2022:2025)))
+jsoes_bongo_biomass_shrimp_larvae <- subset(jsoes_bongo_biomass_shrimp_larvae, !(year %in% c(1998, 2022:2025)))
+
+
+
+# add a nmi and km from shore from shore column based on the station codes
+add_nmi_km <- function(data){
+  data %>% 
+    mutate(nmi_from_shore = parse_number(station)) %>% 
+    # change nmi to km to keep units consistent
+    mutate(km_from_shore = nmi_from_shore * 1.852) -> output
+  
+  return(output)
+}
+
+jsoes_bongo_biomass_cancer_crab_larvae <- add_nmi_km(jsoes_bongo_biomass_cancer_crab_larvae)
+jsoes_bongo_biomass_hyperiid_amphipods <- add_nmi_km(jsoes_bongo_biomass_hyperiid_amphipods)
+jsoes_bongo_biomass_non_cancer_crab_larvae <- add_nmi_km(jsoes_bongo_biomass_non_cancer_crab_larvae)
+jsoes_bongo_biomass_shrimp_larvae <- add_nmi_km(jsoes_bongo_biomass_shrimp_larvae)
+
+# the other script already deals with the crs, and the X and Y columns contain
+# the UTM zone 10 distances in km
+
+
+#### load and reformat spatial data ####
+usa_spdf <- st_read(here::here("Data", "map_files", "USA_adm0.shp"))
+# load BC
+CAN_spdf <- st_read(here::here("Data", "map_files", "canada", "lpr_000b16a_e.shp"))
+BC_spdf <- filter(CAN_spdf, PRENAME == "British Columbia")
+BC_proj <- st_transform(BC_spdf, crs = 4326)
+
+
+# crop them to our desired area
+US_west_coast <- sf::st_crop(usa_spdf,
+                             c(xmin = -126, ymin = 44, xmax = -123, ymax = 48.5))
+
+BC_coast <- sf::st_crop(BC_proj,
+                        c(xmin = -126, ymin = 44, xmax = -123, ymax = 48.5))
+
+
+
+# convert both shapefiles to a different projection (UTM zone 10) so that they can be plotted with the sdmTMB output
+UTM_zone_10_crs <- 32610
+
+US_west_coast_proj <- sf::st_transform(US_west_coast, crs = UTM_zone_10_crs)
+BC_coast_proj <- sf::st_transform(BC_coast, crs = UTM_zone_10_crs)
+
+# make this projection into kilometers
+US_west_coast_proj_km <- st_as_sf(US_west_coast_proj$geometry/1000, crs = UTM_zone_10_crs)
+BC_coast_proj_km <- st_as_sf(BC_coast_proj$geometry/1000, crs = UTM_zone_10_crs)
+
+
+
+#### load and reformat SST data ####
+SST1 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_9bdb_17ce_0aa0.csv"), skip = 1)
+SST2 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_36e3_7cb3_1109.csv"), skip = 1)
+SST3 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_519c_f955_0fea.csv"), skip = 1)
+SST4 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_727c_5c10_e6a0.csv"), skip = 1)
+SST5 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_1176_fc5f_53d2.csv"), skip = 1)
+SST6 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_ae0c_9197_083f.csv"), skip = 1)
+SST7 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_fe4f_9c9c_442e.csv"), skip = 1)
+
+SST1 %>% 
+  bind_rows(., SST2, SST3, SST4, SST5, SST6, SST7) -> SST
+
+SST %>% 
+  dplyr::rename(time = UTC, latitude = degrees_north, longitude = degrees_east, SST = degree_C) -> SST
+SST %>% 
+  mutate(time = ymd_hms(time)) %>% 
+  mutate(day_of_month = mday(time)) %>% 
+  mutate(year = year(time)) %>% 
+  mutate(julian = yday(time))-> SST
+
+# Looks good to me! Now just need to resolve CRS conflicts
+
+# Convert SST to UTM zone 10
+# st_as_sf(SST, coords = c("latitude", "longitude"), crs = "4326") -> SST_sf
+st_as_sf(SST, coords = c("longitude", "latitude"), crs = 4326) -> SST_sf
+US_west_coast
+
+sf::st_transform(SST_sf, crs = UTM_zone_10_crs) -> SST_sf_proj
+
+# convert to km
+SST_sf_proj_km <- SST_sf_proj
+SST_sf_proj_km$geometry <- SST_sf_proj$geometry/1000
+
+SST_sf_proj_km <- st_set_crs(SST_sf_proj_km, UTM_zone_10_crs)
+
+# Match this SST data to the JSOES bongo data
+# jsoes needs to be in SF format as well
+
+st_as_sf(jsoes_bongo_biomass_cancer_crab_larvae, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_cancer_crab_larvae_sf
+st_as_sf(jsoes_bongo_biomass_hyperiid_amphipods, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_hyperiid_amphipods_sf
+st_as_sf(jsoes_bongo_biomass_non_cancer_crab_larvae, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_non_cancer_crab_larvae_sf
+st_as_sf(jsoes_bongo_biomass_shrimp_larvae, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_shrimp_larvae_sf
+
+jsoes_bongo_biomass_cancer_crab_larvae_sf_split <- split(jsoes_bongo_biomass_cancer_crab_larvae_sf, jsoes_bongo_biomass_cancer_crab_larvae_sf$year)
+jsoes_bongo_biomass_hyperiid_amphipods_sf_split <- split(jsoes_bongo_biomass_hyperiid_amphipods_sf, jsoes_bongo_biomass_hyperiid_amphipods_sf$year)
+jsoes_bongo_biomass_non_cancer_crab_larvae_sf_split <- split(jsoes_bongo_biomass_non_cancer_crab_larvae_sf, jsoes_bongo_biomass_non_cancer_crab_larvae_sf$year)
+jsoes_bongo_biomass_shrimp_larvae_sf_split <- split(jsoes_bongo_biomass_shrimp_larvae_sf, jsoes_bongo_biomass_shrimp_larvae_sf$year)
+SST_sf_proj_km_split <- split(SST_sf_proj_km, SST_sf_proj_km$year) 
+
+jsoes_years <- as.character(unique(jsoes_bongo_biomass_cancer_crab_larvae_sf$year))
+
+jsoes_bongo_biomass_cancer_crab_larvae_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_cancer_crab_larvae_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_cancer_crab_larvae <- list_rbind(jsoes_bongo_biomass_cancer_crab_larvae_remote_SST_list)
+
+jsoes_bongo_biomass_hyperiid_amphipods_sf_split_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_hyperiid_amphipods_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_hyperiid_amphipods <- list_rbind(jsoes_bongo_biomass_hyperiid_amphipods_sf_split_remote_SST_list)
+
+
+jsoes_bongo_biomass_non_cancer_crab_larvae_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_non_cancer_crab_larvae_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_non_cancer_crab_larvae <- list_rbind(jsoes_bongo_biomass_non_cancer_crab_larvae_remote_SST_list)
+
+
+jsoes_bongo_biomass_shrimp_larvae_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_shrimp_larvae_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_shrimp_larvae <- list_rbind(jsoes_bongo_biomass_shrimp_larvae_remote_SST_list)
+
+#### Calculate distance to shore ####
+
+### cancer crab larvae
+dplyr::select(jsoes_bongo_biomass_cancer_crab_larvae, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_cancer_crab_larvae_spatial
+st_as_sf(jsoes_bongo_biomass_cancer_crab_larvae_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_cancer_crab_larvae_sf
+st_distance(jsoes_bongo_biomass_cancer_crab_larvae_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_cancer_crab_larvae_dist_shore
+jsoes_bongo_biomass_cancer_crab_larvae$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_cancer_crab_larvae_dist_shore)
+
+# rescale data
+jsoes_bongo_biomass_cancer_crab_larvae %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_cancer_crab_larvae
+
+### hyperiid amphipods
+dplyr::select(jsoes_bongo_biomass_hyperiid_amphipods, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_hyperiid_amphipods_spatial
+st_as_sf(jsoes_bongo_biomass_hyperiid_amphipods_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_hyperiid_amphipods_sf
+st_distance(jsoes_bongo_biomass_hyperiid_amphipods_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_hyperiid_amphipods_dist_shore
+jsoes_bongo_biomass_hyperiid_amphipods$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_hyperiid_amphipods_dist_shore)
+
+
+# rescale data
+jsoes_bongo_biomass_hyperiid_amphipods %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_hyperiid_amphipods
+
+### non-cancer crab larvae
+dplyr::select(jsoes_bongo_biomass_non_cancer_crab_larvae, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_non_cancer_crab_larvae_spatial
+st_as_sf(jsoes_bongo_biomass_non_cancer_crab_larvae_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_non_cancer_crab_larvae_sf
+st_distance(jsoes_bongo_biomass_non_cancer_crab_larvae_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_non_cancer_crab_larvae_dist_shore
+jsoes_bongo_biomass_non_cancer_crab_larvae$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_non_cancer_crab_larvae_dist_shore)
+
+# rescale data
+jsoes_bongo_biomass_non_cancer_crab_larvae %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_non_cancer_crab_larvae
+
+
+### shrimp larvae
+dplyr::select(jsoes_bongo_biomass_shrimp_larvae, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_shrimp_larvae_spatial
+st_as_sf(jsoes_bongo_biomass_shrimp_larvae_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_shrimp_larvae_sf
+st_distance(jsoes_bongo_biomass_shrimp_larvae_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_shrimp_larvae_dist_shore
+jsoes_bongo_biomass_shrimp_larvae$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_shrimp_larvae_dist_shore)
+
+# rescale data
+jsoes_bongo_biomass_shrimp_larvae %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_shrimp_larvae
+
+#### Create SPDE objects ####
+
+# note that all bongo taxa have the same samples, so any of the corresponding 
+# data frames can be used for this section
+
+bongo_spde <- fm_fem( bongo_inla_mesh_cutoff15, 
+                      order = 2 )
+
+# create projection matrix from vertices to samples
+A_is_bongo = fm_evaluator(bongo_inla_mesh_cutoff15, loc = as.matrix(data.frame(X = jsoes_bongo_biomass_shrimp_larvae$X, Y = jsoes_bongo_biomass_shrimp_larvae$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+A_gs_bongo = fm_evaluator( bongo_inla_mesh_cutoff15, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_bongo <- make_anisotropy_spde( bongo_inla_mesh_cutoff15 )
+```
+
+# Data visualizations
+
+Export the mesh and projection grid for the supplemental figures
+```{r export_mesh_figures}
+#### JSOES Midwater Trawl ####
+
+# transform mesh to sf
+fm_as_sfc(inla_mesh_cutoff15) %>% 
+  st_set_crs(st_crs(UTM_zone_10_crs)) -> inla_mesh_cutoff15_sf
+
+JSOES_trawl_mesh_plot <- survey_area_basemap_km +
+  geom_point(data = subset(survey_predict_grid, year == 2017), aes(x = X, y = Y), color = "gray50", alpha = 0.25) +
+  geom_sf(data = inla_mesh_cutoff15_sf, fill = NA, color = "black") +
+  geom_point(data = csyif, aes(x = X, y = Y), color = "white",fill = "red", shape = 24, size = 3)
+
+ggsave(here::here("figures", "paper_figures", "mesh_figures", "JSOES_trawl_mesh_plot.png"), JSOES_trawl_mesh_plot,  height = 8, width = 4)
+
+#### JSOES Bongo Tows ####
+
+# transform mesh to sf
+fm_as_sfc(bongo_inla_mesh_cutoff15) %>% 
+  st_set_crs(st_crs(UTM_zone_10_crs)) -> bongo_inla_mesh_cutoff15_sf
+
+JSOES_bongo_mesh_plot <- survey_area_basemap_km +
+  geom_sf(data = bongo_inla_mesh_cutoff15_sf, fill = NA, color = "black") +
+  geom_point(data = subset(survey_predict_grid, year == 2017), aes(x = X, y = Y), color = "gray50", alpha = 0.25) +
+  geom_point(data = jsoes_bongo_cancer_crab_larvae, aes(x = X, y = Y), color = "white",fill = "red", shape = 24, size = 3)
+
+ggsave(here::here("figures", "paper_figures", "mesh_figures", "JSOES_bongo_mesh_plot.png"), JSOES_bongo_mesh_plot,  height = 8, width = 4)
+```
+
+Export plots of survey data
+```{r plot_distribtion}
+#### JSOES Midwater Trawls ####
+csyif_june_dist_plot <- plot_distribution(data = csyif, taxon_name = "Yearling Interior Fall Chinook")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "csyif_june_dist_plot.png"), csyif_june_dist_plot,  
+       height = 10, width = 12)
+
+cssif_june_dist_plot <- plot_distribution(data = cssif, taxon_name = "Subyearling Interior Fall Chinook")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "cssif_june_dist_plot.png"), cssif_june_dist_plot,  
+       height = 10, width = 12)
+
+#### JSOES Bongo Tows ####
+non_cancer_crab_larvae_june_biomass_plot <- plot_distribution_jsoes_bongo_biomass(data = jsoes_bongo_biomass_non_cancer_crab_larvae, taxon_name = "Non-Cancer Crab Larvae")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "non_cancer_crab_larvae_june_biomass_plot.png"), non_cancer_crab_larvae_june_biomass_plot,  
+       height = 10, width = 16)
+
+
+cancer_crab_larvae_june_biomass_plot <- plot_distribution_jsoes_bongo_biomass(data = jsoes_bongo_biomass_cancer_crab_larvae, taxon_name = "Cancer Crab Larvae")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "cancer_crab_larvae_june_biomass_plot.png"), cancer_crab_larvae_june_biomass_plot,  
+       height = 10, width = 16)
+
+shrimp_larvae_june_biomass_plot <- plot_distribution_jsoes_bongo_biomass(data = jsoes_bongo_biomass_shrimp_larvae, taxon_name = "Shrimp Larvae")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "shrimp_larvae_june_biomass_plot.png"), shrimp_larvae_june_biomass_plot,  
+       height = 10, width = 16)
+
+hyperiid_amphipods_june_biomass_plot <- plot_distribution_jsoes_bongo_biomass(data = jsoes_bongo_biomass_hyperiid_amphipods, taxon_name = "Hyperiid Amphipods")
+
+ggsave(here::here("figures", "paper_figures", "survey_data_plots",  "hyperiid_amphipods_june_biomass_plot.png"), hyperiid_amphipods_june_biomass_plot,  
+       height = 10, width = 16)
+
+```
+
+
+# Fit SDM
+
+```{r SDM_inputs_prep}
+# create covariate grids for projections
+# generate the projection vector/matrix for covariates - this relies
+# on the survey prediction grid from the JSOES_make_mesh.R script
+
+distance_projection_vector <- as.numeric(filter(survey_predict_grid, year == 2000)$dist_shore_scaled)
+
+# for SST - take prediction grid, drop salinity, add SST with locations as rows and years as column
+survey_predict_grid %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, sal, sal_scaled, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix
+
+
+common_years_jsoes_bongo_biomass_model <- intersect(unique(csyif$year), # jsoes trawl
+                          unique(jsoes_bongo_cancer_crab_larvae$year)) # jsoes bongo
+
+# CSYIF
+# nothing additional required
+
+# CSSIS
+# smoothers
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm_cssif <- parse_smoothers(formula = "n_per_km ~ s(dist_shore_scaled)", data = as.data.frame(cssif), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid_cssif <- data.frame(SST_scaled = as.vector(temperature_projection_matrix),
+                           dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix)))
+
+sm_predict_cssif <- parse_smoothers(formula = "n_per_km ~ s(dist_shore_scaled)", data = as.data.frame(cssif), knots = NULL,
+                              newdata = predict_grid_cssif, basis_prev = sm_cssif$basis_out)
+
+
+# shrimp larvae
+# smoothers
+# to get the sdmTMB code to work, you just need to make sure that you provide the smooth terms in a formula (no need to write the complete formula)
+sm_shrimp_larvae <- parse_smoothers(formula = "total_sum_of_final_carbon_mg_m3 ~ s(dist_shore_scaled)", data = as.data.frame(jsoes_bongo_shrimp_larvae), knots = NULL)
+
+# get smoother values for predict grid
+predict_grid_shrimp_larvae <- data.frame(
+  dist_shore_scaled = rep(distance_projection_vector, ncol(temperature_projection_matrix)))
+
+sm_predict_shrimp_larvae <- parse_smoothers(formula = "total_sum_of_final_carbon_mg_m3 ~ s(dist_shore_scaled)", data = as.data.frame(jsoes_bongo_shrimp_larvae), knots = NULL,
+                              newdata = predict_grid_shrimp_larvae, basis_prev = sm_shrimp_larvae$basis_out)
+
+# Cancer crab larvae
+# nothing additional required
+
+# Non-cancer crab larvae
+# nothing additional required
+
+# Hyperiid amphipods
+# nothing additional required
+```
+
+```{r}
+# save.image(here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "05_1_jsoes_bongo_biomass_SDM.rda"))
+# load(here::here("R", "05_stage1_SDM", "05.1_prey_field_SDM", "05.1_prey_field_SDM.rda"))
+
+compile(here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "05_1_jsoes_bongo_biomass_SDM.cpp"))
+dyn.load(dynlib(here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "05_1_jsoes_bongo_biomass_SDM")))
+
+jsoes_bongo_biomass_SDM_Data = list(
+  ## time series lengths
+  "n_t_jsoes" = length(unique(csyif$year)),
+  "n_t_shared" = length(common_years_jsoes_bongo_biomass_model),
+  # the indices of the different data sources in the common years
+  "t_jsoes_indices" = match(common_years_jsoes_bongo_biomass_model, unique(csyif$year))-1,
+  
+  # temperature and distance projection matrices
+  "temp_gt" = temperature_projection_matrix,
+  "dist_g" = distance_projection_vector,
+  
+  ## csyif data
+  "weights_i_csyif" = rep(1, length(csyif$n_per_km)), # weights (all 1)
+  "D_i_csyif"= csyif$n_per_km/max(csyif$n_per_km)*1000, "t_i_csyif" =  csyif$year - min(csyif$year),
+  "A_is_csyif"=trawl_is, "A_gs_csyif"=trawl_gs, # "M0_b"=trawl_spde$c0, "M1_b"=trawl_spde$g1, "M2_b"=trawl_spde$g2,
+  "spatial_list_csyif" = spatial_list_trawl,
+  "temp_i_csyif" = csyif$SST_scaled,
+  
+  ## cssif data
+  "weights_i_cssif" = rep(1, length(cssif$n_per_km)), # weights (all 1)
+  "D_i_cssif"= cssif$n_per_km/max(cssif$n_per_km)*1000,
+  "t_i_cssif" = cssif$year - min(cssif$year),
+  "A_is_cssif"=trawl_is, "A_gs_cssif"=trawl_gs, # "M0_b"=trawl_spde$c0, "M1_b"=trawl_spde$g1, "M2_b"=trawl_spde$g2,
+  "spatial_list_cssif" = spatial_list_trawl,
+  "temp_i_cssif" = cssif$SST_scaled,
+  "dist_i_cssif" = cssif$dist_shore_scaled,
+  # cssif smooth function data
+  "Zs_cssif" = sm_cssif$Zs, # smoother basis function matrices
+  "Xs_cssif" = sm_cssif$Xs, # smoother linear effect matrix
+  "b_smooth_start_cssif" = sm_cssif$b_smooth_start,
+  "proj_Zs_cssif" = sm_predict_cssif$Zs,
+  "proj_Xs_cssif" = sm_predict_cssif$Xs,
+  
+  ## cancer_crab_larvae data
+  "weights_i_cancer_crab_larvae" = rep(1, length(jsoes_bongo_biomass_cancer_crab_larvae$total_sum_of_final_carbon_mg_m3)), # weights (all 1)
+  "D_i_cancer_crab_larvae"= jsoes_bongo_biomass_cancer_crab_larvae$total_sum_of_final_carbon_mg_m3/max(jsoes_bongo_biomass_cancer_crab_larvae$total_sum_of_final_carbon_mg_m3)*1000,
+  # note that there are missing years of data - so this just represents the order of years (but there are gaps!)
+  "t_i_cancer_crab_larvae" = jsoes_bongo_biomass_cancer_crab_larvae$year - min(jsoes_bongo_biomass_cancer_crab_larvae$year),
+  "A_is_cancer_crab_larvae"=A_is_bongo, "A_gs_cancer_crab_larvae"=A_gs_bongo,
+  "spatial_list_cancer_crab_larvae" = spatial_list_bongo,
+  
+  ## non_cancer_crab_larvae data
+  "weights_i_non_cancer_crab_larvae" = rep(1, length(jsoes_bongo_biomass_non_cancer_crab_larvae$total_sum_of_final_carbon_mg_m3)), # weights (all 1)
+  "D_i_non_cancer_crab_larvae"= jsoes_bongo_biomass_non_cancer_crab_larvae$total_sum_of_final_carbon_mg_m3/max(jsoes_bongo_biomass_non_cancer_crab_larvae$total_sum_of_final_carbon_mg_m3)*1000,
+  # note that there are missing years of data - so this just represents the order of years (but there are gaps!)
+  "t_i_non_cancer_crab_larvae" = jsoes_bongo_biomass_non_cancer_crab_larvae$year - min(jsoes_bongo_biomass_non_cancer_crab_larvae$year),
+  "A_is_non_cancer_crab_larvae"=A_is_bongo, "A_gs_non_cancer_crab_larvae"=A_gs_bongo,
+  "spatial_list_non_cancer_crab_larvae" = spatial_list_bongo,
+  "dist_i_non_cancer_crab_larvae" = jsoes_bongo_biomass_non_cancer_crab_larvae$dist_shore_scaled,
+  
+  ## hyperiid_amphipods data
+  "weights_i_hyperiid_amphipods" = rep(1, length(jsoes_bongo_biomass_hyperiid_amphipods$total_sum_of_final_carbon_mg_m3)), # weights (all 1)
+  "D_i_hyperiid_amphipods"= jsoes_bongo_biomass_hyperiid_amphipods$total_sum_of_final_carbon_mg_m3/max(jsoes_bongo_biomass_hyperiid_amphipods$total_sum_of_final_carbon_mg_m3)*1000,
+  # note that there are missing years of data - so this just represents the order of years (but there are gaps!)
+  "t_i_hyperiid_amphipods" = jsoes_bongo_biomass_hyperiid_amphipods$year - min(jsoes_bongo_biomass_hyperiid_amphipods$year),
+  "A_is_hyperiid_amphipods"=A_is_bongo, "A_gs_hyperiid_amphipods"=A_gs_bongo,
+  "spatial_list_hyperiid_amphipods" = spatial_list_bongo,
+  
+  ## shrimp_larvae data
+  "weights_i_shrimp_larvae" = rep(1, length(jsoes_bongo_biomass_shrimp_larvae$total_sum_of_final_carbon_mg_m3)), # weights (all 1)
+  "D_i_shrimp_larvae"= jsoes_bongo_biomass_shrimp_larvae$total_sum_of_final_carbon_mg_m3/max(jsoes_bongo_biomass_shrimp_larvae$total_sum_of_final_carbon_mg_m3)*1000,
+  # note that there are missing years of data - so this just represents the order of years (but there are gaps!)
+  "t_i_shrimp_larvae" = jsoes_bongo_biomass_shrimp_larvae$year - min(jsoes_bongo_biomass_shrimp_larvae$year),
+  "A_is_shrimp_larvae"=A_is_bongo, "A_gs_shrimp_larvae"=A_gs_bongo,
+  "spatial_list_shrimp_larvae" = spatial_list_bongo,
+  "dist_i_shrimp_larvae" = jsoes_bongo_biomass_shrimp_larvae$dist_shore_scaled,
+  # shrimp larvae smooth function data
+  "Zs_shrimp_larvae" = sm_shrimp_larvae$Zs, # smoother basis function matrices
+  "Xs_shrimp_larvae" = sm_shrimp_larvae$Xs, # smoother linear effect matrix
+  "b_smooth_start_shrimp_larvae" = sm_shrimp_larvae$b_smooth_start,
+  "proj_Zs_shrimp_larvae" = sm_predict_shrimp_larvae$Zs,
+  "proj_Xs_shrimp_larvae" = sm_predict_shrimp_larvae$Xs
+)
+
+
+jsoes_bongo_biomass_SDM_Params <- list(
+  
+  ## csyif fixed effects
+  "beta_temp_csyif" = 0,
+  "ln_tau_omega_csyif"=0,  "ln_tau_epsilon_csyif"=0,
+  "ln_kappa_csyif"=0, "ln_phi_csyif" = 0,
+  "ln_H_input_csyif" = c(0, 0),
+  "finv_power_csyif" = 0,
+  
+  "logit_rhoE_csyif" = 0,
+  
+  # csyif random effects
+  "omega_s_csyif"=rnorm(nrow(trawl_spde$c0)),
+  "epsilon_st_csyif"=matrix(0, nrow=nrow(trawl_spde$c0), ncol=jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  
+  ## cssif fixed effects
+  "beta_temp_cssif" = 0,
+  "ln_tau_epsilon_cssif"=0,
+  "ln_tau_omega_cssif"=0, 
+  "ln_kappa_cssif"=0,
+  "ln_phi_cssif" = 0,
+  "ln_H_input_cssif" = c(0, 0),
+  "finv_power_cssif" = 0,
+  
+  # "logit_rhoE_cssif" = 0,
+  
+  # cssif random effects
+  "omega_s_cssif"=rnorm(nrow(trawl_spde$c0)),
+  "epsilon_st_cssif"=matrix(0, nrow=nrow(trawl_spde$c0), ncol=jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  
+  # cssif smooth functions
+  "bs_cssif" = rep(0, ncol(sm_cssif$Xs)),
+  "b_smooth_cssif" = rep(0, sum(sm_cssif$sm_dims)),
+  "ln_smooth_sigma_cssif" = rep(0, length(sm_cssif$sm_dims)),
+  
+  ## cancer_crab_larvae fixed effects
+  "ln_tau_omega_cancer_crab_larvae"=0,  "ln_tau_epsilon_cancer_crab_larvae"=0,
+  "ln_kappa_cancer_crab_larvae"=0, "ln_phi_cancer_crab_larvae" = 0,
+  "ln_H_input_cancer_crab_larvae" = c(0, 0),
+  "finv_power_cancer_crab_larvae" = 0,
+  "logit_rhoE_cancer_crab_larvae" = 0,
+  
+  # cancer_crab_larvae random effects
+  "omega_s_cancer_crab_larvae"=rnorm(nrow(bongo_spde$c0)),
+  "epsilon_st_cancer_crab_larvae"=matrix(0, nrow=nrow(bongo_spde$c0), ncol=jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  
+  ## non_cancer_crab_larvae fixed effects
+  "beta_t_non_cancer_crab_larvae"=rep(0, jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  "beta_dist_non_cancer_crab_larvae" = 0,
+  "ln_tau_omega_non_cancer_crab_larvae"=0,  "ln_tau_epsilon_non_cancer_crab_larvae"=0,
+  "ln_kappa_non_cancer_crab_larvae"=0, "ln_phi_non_cancer_crab_larvae" = 0,
+  "ln_H_input_non_cancer_crab_larvae" = c(0, 0),
+  "finv_power_non_cancer_crab_larvae" = 0,
+  "logit_rhoE_non_cancer_crab_larvae" = 0,
+  
+  # non_cancer_crab_larvae random effects
+  "omega_s_non_cancer_crab_larvae"=rnorm(nrow(bongo_spde$c0)),
+  "epsilon_st_non_cancer_crab_larvae"=matrix(0, nrow=nrow(bongo_spde$c0), ncol=jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  
+  ## hyperiid_amphipods fixed effects
+  # "beta_t_hyperiid_amphipods"=rep(0, jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  "ln_tau_omega_hyperiid_amphipods"=0,  "ln_tau_epsilon_hyperiid_amphipods"=0,
+  "ln_kappa_hyperiid_amphipods"=0, "ln_phi_hyperiid_amphipods" = 0,
+  "ln_H_input_hyperiid_amphipods" = c(0, 0),
+  "finv_power_hyperiid_amphipods" = 0,
+
+  
+  # hyperiid_amphipods random effects
+  "omega_s_hyperiid_amphipods"=rnorm(nrow(bongo_spde$c0)),
+  "epsilon_st_hyperiid_amphipods"=matrix(0, nrow=nrow(bongo_spde$c0), ncol=jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  
+  ## shrimp_larvae fixed effects
+  "ln_tau_omega_shrimp_larvae"=0,  "ln_tau_epsilon_shrimp_larvae"=0,
+  "ln_kappa_shrimp_larvae"=0, "ln_phi_shrimp_larvae" = 0,
+  "ln_H_input_shrimp_larvae" = c(0, 0),
+  "finv_power_shrimp_larvae" = 0,
+  "logit_rhoE_shrimp_larvae" = 0,
+  
+  # shrimp_larvae random effects
+  "omega_s_shrimp_larvae"=rnorm(nrow(bongo_spde$c0)),
+  "epsilon_st_shrimp_larvae"=matrix(0, nrow=nrow(bongo_spde$c0), ncol=jsoes_bongo_biomass_SDM_Data$n_t_jsoes),
+  
+  # shrimp larvae smooth functions
+  "bs_shrimp_larvae" = rep(0, ncol(sm_shrimp_larvae$Xs)),
+  "b_smooth_shrimp_larvae" = rep(0, sum(sm_shrimp_larvae$sm_dims)),
+  "ln_smooth_sigma_shrimp_larvae" = rep(0, length(sm_shrimp_larvae$sm_dims))
+  
+)
+
+jsoes_bongo_biomass_SDM_Obj = MakeADFun( data=jsoes_bongo_biomass_SDM_Data,
+                                                parameters=jsoes_bongo_biomass_SDM_Params,
+                                                random= c("omega_s_csyif", "epsilon_st_csyif",
+                                                          "omega_s_cssif", "epsilon_st_cssif", "b_smooth_cssif",
+                                                          "omega_s_cancer_crab_larvae", "epsilon_st_cancer_crab_larvae",
+                                                          "omega_s_non_cancer_crab_larvae", "epsilon_st_non_cancer_crab_larvae",
+                                                          "omega_s_hyperiid_amphipods", "epsilon_st_hyperiid_amphipods",
+                                                          "omega_s_shrimp_larvae", "epsilon_st_shrimp_larvae", "b_smooth_shrimp_larvae"),
+                                                DLL = "05_1_jsoes_bongo_biomass_SDM")
+
+# Optimize
+jsoes_bongo_biomass_SDM_Opt = nlminb( start=jsoes_bongo_biomass_SDM_Obj$par, obj=jsoes_bongo_biomass_SDM_Obj$fn, grad=jsoes_bongo_biomass_SDM_Obj$gr )
+# add getJointPrecision for index
+jsoes_bongo_biomass_SDM_Opt$SD = sdreport( jsoes_bongo_biomass_SDM_Obj, bias.correct=TRUE, getJointPrecision = TRUE )
+jsoes_bongo_biomass_SDM_report = jsoes_bongo_biomass_SDM_Obj$report()
+
+jsoes_bongo_biomass_SDM_output <- list(jsoes_bongo_biomass_SDM_Obj = jsoes_bongo_biomass_SDM_Obj,
+                                              jsoes_bongo_biomass_SDM_Opt = jsoes_bongo_biomass_SDM_Opt,
+                                              jsoes_bongo_biomass_SDM_report = jsoes_bongo_biomass_SDM_report)
+
+save(jsoes_bongo_biomass_SDM_output,
+     file = here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "jsoes_bongo_biomass_SDM_output.rda"))
+
+```
