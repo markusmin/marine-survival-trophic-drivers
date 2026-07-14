@@ -6,3 +6,15 @@
 .DS_Store
 /map_files/
 /Data/PTAGIS/
+
+# ignore the rendered model files
+*.o
+*.so
+
+# ignore the model output
+*.rda
+.RData
+
+# ignore the large PIT tag inputs
+/model_inputs/chinook_det_hist.csv
+/model_inputs/chinook_transport.csv
