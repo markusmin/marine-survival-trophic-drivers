@@ -1,0 +1,1448 @@
+---
+title: "06.2.6_fit_seabird_two_prey_SAR"
+author: "Markus Min"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+This document fits the 06.2.6_seabird_two_prey_SAR model, which incorporates the following data sources:
+
+1. JSOES Bongo data (biomass)
+2. PWCC/PRS rockfish data
+3. JSOES trawl data (for yearling and subyearling Interior Chinook)
+4. JSOES seabird data (for Common Murres and Sooty Shearwaters)
+
+The prey metrics come from 05.1, and the seabird metrics come from 05.2.
+
+This model does not account for the abundance of salmon in the survey.
+
+This model is fit to the combined SRF + UCSF dataset, and incorporates the effect of 
+transport (and stock group) by having three terms for the effect of SRF (transported),
+SRF (non-transported), and UCSF (non-transported). It also does not include
+an intercept term (no beta_0), with the previous terms instead functioning as 
+intercepts for the three groups.
+
+Outmigration terms are also separate for the two stock groups.
+
+
+```{r load_libraries_source_scripts, include = FALSE}
+library(tidyverse)
+library(here)
+library(TMB)
+library(ggforce)
+library(sdmTMB)
+library(kableExtra)
+library(fmesher)
+library(ggrepel)
+# knitr::opts_chunk()
+
+# source the function scripts
+source("R/functions/cAIC.R")
+source("R/functions/rmvnorm_prec.R")
+source("R/functions/sample_var.R")
+source("R/functions/plot_anisotropy_MM.R")
+source("R/functions/make_anisotropy_spde.R")
+source("R/functions/H_matrix_prior_predictive_check_for_ggplot.R")
+source("R/functions/plot_distribution.R")
+source("R/functions/plot_distribution_PRS_PWCC.R")
+source("R/functions/plot_distribution_jsoes_bongo.R")
+# source("R/functions/plot_distribution_hake_survey.R")
+source("R/functions/generate_prediction_maps.R")
+source("R/functions/generate_prediction_maps_PRS_PWCC.R")
+source("R/functions/generate_prediction_maps_jsoes_bongo.R")
+source("R/functions/generate_prediction_maps_hake_survey.R")
+source("R/functions/generate_prediction_maps_cces.R")
+source("R/functions/stage2_helper_functions.R")
+
+# source the prep scripts for each of the surveys
+source(here::here("R", "PRS_PWCC_make_mesh.R"))
+source(here::here("R", "JSOES_seabirds_make_mesh.R"))
+source(here::here("R", "JSOES_make_mesh.R"))
+
+```
+
+## Prepare survey data for SDMs
+
+#### CSYIF + CSSIF (JSOES Trawl)
+```{r csyif_cssif_data_prep}
+
+#### prep model data ####
+
+# extract Yearling Interior Chinook
+csyif <- subset(jsoes_long, species == "chinook_salmon_yearling_interior_fa")
+# extract subyearling Interior Chinook
+cssif <- subset(jsoes_long, species == "chinook_salmon_subyearling_interior_fa")
+
+# generate the projection vector/matrix for covariates - this relies
+# on the survey prediction grid from the JSOES_make_mesh.R script
+
+distance_projection_vector <- as.numeric(filter(survey_predict_grid, year == 2000)$dist_shore_scaled)
+
+# for SST - take prediction grid, drop salinity, add SST with locations as rows and years as column
+survey_predict_grid %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, sal, sal_scaled, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix
+
+#### Create SPDE objects ####
+
+# there are multiple meshes that are created in JSOES_make_mesh.R
+# here, we will use the cutoff 15 mesh, although a higher resolution is likely going
+# to improve results (at the cost of run time)
+
+trawl_spde <- fm_fem( inla_mesh_cutoff15, 
+                      order = 2 )
+
+# create projection matrix from vertices to samples
+trawl_is = fm_evaluator(inla_mesh_cutoff15, loc = as.matrix(data.frame(X = csyif$X, Y = csyif$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+trawl_gs = fm_evaluator( inla_mesh_cutoff15, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_trawl <- make_anisotropy_spde( inla_mesh_cutoff15 )
+```
+
+
+
+#### Common Murres + Sooty Shearwaters (JSOES seabirds)
+
+```{r data_prep}
+#### prep model data ####
+# extract Sooty Shearwaters
+sosh <- subset(birds_long, species == "sooty_shearwater")
+comu <- subset(birds_long, species == "common_murre")
+
+# generate the projection vector/matrix for covariates - this relies
+# on the survey prediction grid from the JSOES_make_mesh.R script
+
+distance_projection_vector <- as.numeric(filter(survey_predict_grid, year == 2010)$dist_shore_scaled)
+
+# for SST - take prediction grid, drop salinity, add SST with locations as rows and years as column
+survey_predict_grid %>% 
+  # select only the years that we're keeping
+  # filter(!(year %in% c(1998, 2022:2025))) %>% 
+  filter(year %in% unique(sosh$year)) %>% 
+  dplyr::select(-c(SST, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix
+  
+# create a second temperature projection grid that contains the missing years
+survey_predict_grid_birds_allyears %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix_birds_allyears
+
+#### Create SPDE objects ####
+
+# there are multiple meshes that are created in JSOES_make_mesh.R
+# here, we will use the cutoff 15 mesh, although a higher resolution is likely going
+# to improve results (at the cost of run time)
+
+### June SPDE objects
+
+birds_spde <- fm_fem( birds_inla_mesh_cutoff15, 
+                      order = 2 )
+
+# create projection matrix from vertices to samples
+A_is_birds = fm_evaluator(birds_inla_mesh_cutoff15, loc = as.matrix(data.frame(X = comu$X, Y = comu$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+A_gs_birds = fm_evaluator( birds_inla_mesh_cutoff15, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_birds <- make_anisotropy_spde( birds_inla_mesh_cutoff15 )
+```
+
+#### Shrimp Larvae, Non-Cancer Crab Larvae, Crab Larvae, Hyperiid Amphipods (JSOES Bongo)
+
+```{r data_prep}
+#### load and reformat bongo data ####
+
+jsoes_bongo_biomass_cancer_crab_larvae <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_cancer_crab_larvae.csv"))
+jsoes_bongo_biomass_hyperiid_amphipods <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_hyperiid_amphipod.csv"))
+jsoes_bongo_biomass_non_cancer_crab_larvae <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_non_cancer_crab_larvae.csv"))
+jsoes_bongo_biomass_shrimp_larvae <- read.csv(here::here("model_inputs", "jsoes_bongo_biomass_shrimp_larvae.csv"))
+
+# drop 1998 (bongo doesn't have this year) and 2022:2025 (adult returns aren't complete for those years yet)
+jsoes_bongo_biomass_cancer_crab_larvae <- subset(jsoes_bongo_biomass_cancer_crab_larvae, !(year %in% c(1998, 2022:2025)))
+jsoes_bongo_biomass_hyperiid_amphipods <- subset(jsoes_bongo_biomass_hyperiid_amphipods, !(year %in% c(1998, 2022:2025)))
+jsoes_bongo_biomass_non_cancer_crab_larvae <- subset(jsoes_bongo_biomass_non_cancer_crab_larvae, !(year %in% c(1998, 2022:2025)))
+jsoes_bongo_biomass_shrimp_larvae <- subset(jsoes_bongo_biomass_shrimp_larvae, !(year %in% c(1998, 2022:2025)))
+
+
+
+# add a nmi and km from shore from shore column based on the station codes
+add_nmi_km <- function(data){
+  data %>% 
+    mutate(nmi_from_shore = parse_number(station)) %>% 
+    # change nmi to km to keep units consistent
+    mutate(km_from_shore = nmi_from_shore * 1.852) -> output
+  
+  return(output)
+}
+
+jsoes_bongo_biomass_cancer_crab_larvae <- add_nmi_km(jsoes_bongo_biomass_cancer_crab_larvae)
+jsoes_bongo_biomass_hyperiid_amphipods <- add_nmi_km(jsoes_bongo_biomass_hyperiid_amphipods)
+jsoes_bongo_biomass_non_cancer_crab_larvae <- add_nmi_km(jsoes_bongo_biomass_non_cancer_crab_larvae)
+jsoes_bongo_biomass_shrimp_larvae <- add_nmi_km(jsoes_bongo_biomass_shrimp_larvae)
+
+# the other script already deals with the crs, and the X and Y columns contain
+# the UTM zone 10 distances in km
+
+
+#### load and reformat spatial data ####
+usa_spdf <- st_read(here::here("Data", "map_files", "USA_adm0.shp"))
+# load BC
+CAN_spdf <- st_read(here::here("Data", "map_files", "canada", "lpr_000b16a_e.shp"))
+BC_spdf <- filter(CAN_spdf, PRENAME == "British Columbia")
+BC_proj <- st_transform(BC_spdf, crs = 4326)
+
+
+# crop them to our desired area
+US_west_coast <- sf::st_crop(usa_spdf,
+                             c(xmin = -126, ymin = 44, xmax = -123, ymax = 48.5))
+
+BC_coast <- sf::st_crop(BC_proj,
+                        c(xmin = -126, ymin = 44, xmax = -123, ymax = 48.5))
+
+
+
+# convert both shapefiles to a different projection (UTM zone 10) so that they can be plotted with the sdmTMB output
+UTM_zone_10_crs <- 32610
+
+US_west_coast_proj <- sf::st_transform(US_west_coast, crs = UTM_zone_10_crs)
+BC_coast_proj <- sf::st_transform(BC_coast, crs = UTM_zone_10_crs)
+
+# make this projection into kilometers
+US_west_coast_proj_km <- st_as_sf(US_west_coast_proj$geometry/1000, crs = UTM_zone_10_crs)
+BC_coast_proj_km <- st_as_sf(BC_coast_proj$geometry/1000, crs = UTM_zone_10_crs)
+
+
+
+#### load and reformat SST data ####
+SST1 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_9bdb_17ce_0aa0.csv"), skip = 1)
+SST2 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_36e3_7cb3_1109.csv"), skip = 1)
+SST3 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_519c_f955_0fea.csv"), skip = 1)
+SST4 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_727c_5c10_e6a0.csv"), skip = 1)
+SST5 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_1176_fc5f_53d2.csv"), skip = 1)
+SST6 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_ae0c_9197_083f.csv"), skip = 1)
+SST7 <- read.csv(here::here("Data", "NOAA_SST", "noaacrwsstDaily_fe4f_9c9c_442e.csv"), skip = 1)
+
+SST1 %>% 
+  bind_rows(., SST2, SST3, SST4, SST5, SST6, SST7) -> SST
+
+SST %>% 
+  dplyr::rename(time = UTC, latitude = degrees_north, longitude = degrees_east, SST = degree_C) -> SST
+SST %>% 
+  mutate(time = ymd_hms(time)) %>% 
+  mutate(day_of_month = mday(time)) %>% 
+  mutate(year = year(time)) %>% 
+  mutate(julian = yday(time))-> SST
+
+# Looks good to me! Now just need to resolve CRS conflicts
+
+# Convert SST to UTM zone 10
+# st_as_sf(SST, coords = c("latitude", "longitude"), crs = "4326") -> SST_sf
+st_as_sf(SST, coords = c("longitude", "latitude"), crs = 4326) -> SST_sf
+US_west_coast
+
+sf::st_transform(SST_sf, crs = UTM_zone_10_crs) -> SST_sf_proj
+
+# convert to km
+SST_sf_proj_km <- SST_sf_proj
+SST_sf_proj_km$geometry <- SST_sf_proj$geometry/1000
+
+SST_sf_proj_km <- st_set_crs(SST_sf_proj_km, UTM_zone_10_crs)
+
+# Match this SST data to the JSOES bongo data
+# jsoes needs to be in SF format as well
+
+st_as_sf(jsoes_bongo_biomass_cancer_crab_larvae, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_cancer_crab_larvae_sf
+st_as_sf(jsoes_bongo_biomass_hyperiid_amphipods, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_hyperiid_amphipods_sf
+st_as_sf(jsoes_bongo_biomass_non_cancer_crab_larvae, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_non_cancer_crab_larvae_sf
+st_as_sf(jsoes_bongo_biomass_shrimp_larvae, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_shrimp_larvae_sf
+
+jsoes_bongo_biomass_cancer_crab_larvae_sf_split <- split(jsoes_bongo_biomass_cancer_crab_larvae_sf, jsoes_bongo_biomass_cancer_crab_larvae_sf$year)
+jsoes_bongo_biomass_hyperiid_amphipods_sf_split <- split(jsoes_bongo_biomass_hyperiid_amphipods_sf, jsoes_bongo_biomass_hyperiid_amphipods_sf$year)
+jsoes_bongo_biomass_non_cancer_crab_larvae_sf_split <- split(jsoes_bongo_biomass_non_cancer_crab_larvae_sf, jsoes_bongo_biomass_non_cancer_crab_larvae_sf$year)
+jsoes_bongo_biomass_shrimp_larvae_sf_split <- split(jsoes_bongo_biomass_shrimp_larvae_sf, jsoes_bongo_biomass_shrimp_larvae_sf$year)
+SST_sf_proj_km_split <- split(SST_sf_proj_km, SST_sf_proj_km$year) 
+
+jsoes_years <- as.character(unique(jsoes_bongo_biomass_cancer_crab_larvae_sf$year))
+
+jsoes_bongo_biomass_cancer_crab_larvae_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_cancer_crab_larvae_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_cancer_crab_larvae <- list_rbind(jsoes_bongo_biomass_cancer_crab_larvae_remote_SST_list)
+
+jsoes_bongo_biomass_hyperiid_amphipods_sf_split_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_hyperiid_amphipods_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_hyperiid_amphipods <- list_rbind(jsoes_bongo_biomass_hyperiid_amphipods_sf_split_remote_SST_list)
+
+
+jsoes_bongo_biomass_non_cancer_crab_larvae_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_non_cancer_crab_larvae_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_non_cancer_crab_larvae <- list_rbind(jsoes_bongo_biomass_non_cancer_crab_larvae_remote_SST_list)
+
+
+jsoes_bongo_biomass_shrimp_larvae_remote_SST_list <- map(jsoes_years, function(year) {
+  jsoes_one_year <- jsoes_bongo_biomass_shrimp_larvae_sf_split[[year]]
+  SST_one_year <- SST_sf_proj_km_split[[year]]
+  
+  # Find nearest features
+  SST_index_for_jsoes <- st_nearest_feature(jsoes_one_year, SST_one_year)
+  
+  # Combine with matched points (optional: include matched geometry or attributes)
+  jsoes_one_year %>%
+    mutate(matched_id = SST_index_for_jsoes) %>%
+    bind_cols(
+      st_drop_geometry(SST_one_year[SST_index_for_jsoes, "SST"]) %>%
+        dplyr::rename(remote_SST = SST)
+    ) %>% 
+    dplyr::select(-matched_id) -> output
+  
+  # transform this to a df
+  st_drop_geometry(output) %>% 
+    bind_cols(st_coordinates(output)) -> output
+  
+  return(output)
+})
+
+# take the list and turn it back into an sf object
+jsoes_bongo_biomass_shrimp_larvae <- list_rbind(jsoes_bongo_biomass_shrimp_larvae_remote_SST_list)
+
+#### Calculate distance to shore ####
+
+### cancer crab larvae
+dplyr::select(jsoes_bongo_biomass_cancer_crab_larvae, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_cancer_crab_larvae_spatial
+st_as_sf(jsoes_bongo_biomass_cancer_crab_larvae_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_cancer_crab_larvae_sf
+st_distance(jsoes_bongo_biomass_cancer_crab_larvae_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_cancer_crab_larvae_dist_shore
+jsoes_bongo_biomass_cancer_crab_larvae$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_cancer_crab_larvae_dist_shore)
+
+# confirm that these are reasonable, based on points from survey
+# they're similar - but not identical
+hist(as.numeric(jsoes_bongo_biomass_cancer_crab_larvae$sf_dist_shore)-jsoes_bongo_biomass_cancer_crab_larvae_spatial$km_from_shore)
+# and they're pretty biased - the distances calculated using sf tend to be smaller
+# Let's just use the sf distance from shore calculated for both prediction grid and
+# the samples themselves
+# Let's also use the SST from remote sensing, instead of the in situ data
+
+
+# rescale data
+jsoes_bongo_biomass_cancer_crab_larvae %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_cancer_crab_larvae
+
+### hyperiid amphipods
+dplyr::select(jsoes_bongo_biomass_hyperiid_amphipods, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_hyperiid_amphipods_spatial
+st_as_sf(jsoes_bongo_biomass_hyperiid_amphipods_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_hyperiid_amphipods_sf
+st_distance(jsoes_bongo_biomass_hyperiid_amphipods_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_hyperiid_amphipods_dist_shore
+jsoes_bongo_biomass_hyperiid_amphipods$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_hyperiid_amphipods_dist_shore)
+
+# confirm that these are reasonable, based on points from survey
+# they're similar - but not identical
+hist(as.numeric(jsoes_bongo_biomass_hyperiid_amphipods$sf_dist_shore)-jsoes_bongo_biomass_hyperiid_amphipods_spatial$km_from_shore)
+# and they're pretty biased - the distances calculated using sf tend to be smaller
+# Let's just use the sf distance from shore calculated for both prediction grid and
+# the samples themselves
+# Let's also use the SST from remote sensing, instead of the in situ data
+
+
+# rescale data
+jsoes_bongo_biomass_hyperiid_amphipods %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_hyperiid_amphipods
+
+### non-cancer crab larvae
+dplyr::select(jsoes_bongo_biomass_non_cancer_crab_larvae, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_non_cancer_crab_larvae_spatial
+st_as_sf(jsoes_bongo_biomass_non_cancer_crab_larvae_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_non_cancer_crab_larvae_sf
+st_distance(jsoes_bongo_biomass_non_cancer_crab_larvae_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_non_cancer_crab_larvae_dist_shore
+jsoes_bongo_biomass_non_cancer_crab_larvae$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_non_cancer_crab_larvae_dist_shore)
+
+# confirm that these are reasonable, based on points from survey
+# they're similar - but not identical
+hist(as.numeric(jsoes_bongo_biomass_non_cancer_crab_larvae$sf_dist_shore)-jsoes_bongo_biomass_non_cancer_crab_larvae_spatial$km_from_shore)
+# and they're pretty biased - the distances calculated using sf tend to be smaller
+# Let's just use the sf distance from shore calculated for both prediction grid and
+# the samples themselves
+# Let's also use the SST from remote sensing, instead of the in situ data
+
+
+# rescale data
+jsoes_bongo_biomass_non_cancer_crab_larvae %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_non_cancer_crab_larvae
+
+
+### shrimp larvae
+dplyr::select(jsoes_bongo_biomass_shrimp_larvae, station, km_from_shore, X, Y) -> jsoes_bongo_biomass_shrimp_larvae_spatial
+st_as_sf(jsoes_bongo_biomass_shrimp_larvae_spatial, coords = c("X", "Y"), crs = UTM_zone_10_crs) -> jsoes_bongo_biomass_shrimp_larvae_sf
+st_distance(jsoes_bongo_biomass_shrimp_larvae_sf, US_west_coast_proj_km) -> jsoes_bongo_biomass_shrimp_larvae_dist_shore
+jsoes_bongo_biomass_shrimp_larvae$sf_dist_shore <- as.numeric(jsoes_bongo_biomass_shrimp_larvae_dist_shore)
+
+# confirm that these are reasonable, based on points from survey
+# they're similar - but not identical
+hist(as.numeric(jsoes_bongo_biomass_shrimp_larvae$sf_dist_shore)-jsoes_bongo_biomass_shrimp_larvae_spatial$km_from_shore)
+# and they're pretty biased - the distances calculated using sf tend to be smaller
+# Let's just use the sf distance from shore calculated for both prediction grid and
+# the samples themselves
+# Let's also use the SST from remote sensing, instead of the in situ data
+
+
+# rescale data
+jsoes_bongo_biomass_shrimp_larvae %>% 
+  mutate(SST_scaled = as.numeric(scale(remote_SST)),
+         dist_shore_scaled = as.numeric(scale(sf_dist_shore))) -> jsoes_bongo_biomass_shrimp_larvae
+
+
+# for SST - take prediction grid, drop distance from shore, add SST with locations as rows and years as column
+survey_predict_grid %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, sal, sal_scaled, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix
+
+
+distance_projection_vector <- as.numeric(filter(survey_predict_grid, year == 2010)$dist_shore_scaled)
+
+#### Create SPDE objects ####
+
+# note that all bongo taxa have the same samples, so any of the corresponding 
+# data frames can be used for this section
+
+bongo_spde <- fm_fem( bongo_inla_mesh_cutoff15, 
+                      order = 2 )
+
+# create projection matrix from vertices to samples
+A_is_bongo = fm_evaluator(bongo_inla_mesh_cutoff15, loc = as.matrix(data.frame(X = jsoes_bongo_biomass_shrimp_larvae$X, Y = jsoes_bongo_biomass_shrimp_larvae$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+A_gs_bongo = fm_evaluator( bongo_inla_mesh_cutoff15, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_bongo <- make_anisotropy_spde( bongo_inla_mesh_cutoff15 )
+```
+
+
+#### Rockfishes (PWCC/PRS)
+
+```{r}
+# make sure rf density is numeric not integer
+rf$total <- as.numeric(rf$total)
+
+#### prep model data ####
+# generate the projection vector/matrix for covariates - this relies
+# on the survey prediction grid from the PRS_PWCC_make_mesh.R script
+
+distance_projection_vector <- as.numeric(filter(survey_predict_grid_jsoes_rf_years, year == 2016)$dist_shore_scaled)
+
+# for SST - take prediction grid, drop salinity, add SST with locations as rows and years as column
+survey_predict_grid_jsoes_rf_years %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix
+
+# create a second temperature projection grid that contains the missing years
+survey_predict_grid_jsoes_rf_allyears %>% 
+  # select only the years that we're keeping
+  filter(!(year %in% c(1998, 2022:2025))) %>% 
+  dplyr::select(-c(SST, dist_shore, dist_shore_scaled)) %>% 
+  pivot_wider(names_from = year, values_from = SST_scaled) %>% 
+  dplyr::select(-c(X, Y)) %>% 
+  as.matrix() -> temperature_projection_matrix_rf_allyears
+
+
+#### Create SPDE objects ####
+
+# there are multiple meshes that are created in JSOES_make_mesh.R
+# here, we will use the cutoff 15 mesh, although a higher resolution is likely going
+# to improve results (at the cost of run time)
+
+PRS_PWCC_spde <- fm_fem( inla_mesh_cutoff15_jsoes_domain, 
+                order = 2 )
+
+# create projection matrix from vertices to samples
+A_is_rf = fm_evaluator(inla_mesh_cutoff15_jsoes_domain, loc = as.matrix(data.frame(X = rf$X, Y = rf$Y)))$proj$A
+
+# create projection matrix from vertices to prediction grid
+# use the prediction grid for only the JSOES domain here
+
+#### Create a survey prediction grid 
+# Create a survey grid from scratch, using SST data
+
+# only keep one year, since that's all we need to make a grid
+SST_sf_proj %>% 
+  filter(year == 2000) -> SST_sf_proj_2000
+
+st_as_sf(SST_sf_proj_2000$geometry/1000, crs = UTM_zone_10_crs) -> SST_sf_proj_km_2000
+
+SST_sf_proj_km_2000$dist_shore <- as.numeric(st_distance(SST_sf_proj_km_2000, US_west_coast_proj_km))
+
+
+# KEY DECISION: To what area do you want to project the SDM to?
+# Some observations of the data:
+# The vast majority of stations are within 60 km of shore, but there are just a couple 
+# that are further out in the Columbia River Plume up to 83 km from shore
+# a total of 15 tows (out of over 2000) are >= 35 nmi (65 km) offshore; many more are 30 or 31 nmi (55.5 or 57.4 km) offshore.
+# We also want to exclude values that are within 0.5 km of shore, because these
+# don't have measureable SST values (they're basically on shore)
+# this can also be seen in the following histogram:
+# hist(jsoes_long$km_from_shore)
+
+# For the N/S dimension, the most northerly transect is typically the FS transect and 
+# the most southerly transect is the NH transect.
+# this corresponds to 44.67 to 48.23 N
+# Let's take these as our N/S boundaries and add 10 km as a buffer.
+min_Y <- mean(subset(jsoes_long, grepl("NH", station))$Y)
+max_Y <- mean(subset(jsoes_long, grepl("FS", station))$Y)
+
+# Based on this, I'm going to propose that we generate a prediction that extends:
+# from 0.5 to 65 km offshore
+# from 44.67 to 48.23 N (+ 10 km on either side)
+
+# trim longitudinally
+SST_sf_proj_km_2000 %>% 
+  filter(dist_shore <= 65 & dist_shore >= 0.5) -> grid_within_65km_shore
+
+# trim latitudinally
+survey_domain <- st_crop(grid_within_65km_shore, xmin = 0, xmax = 100000, ymin=min_Y-10, ymax=max_Y+10)
+
+# let's inspect the grid that we created
+# ggplot(survey_domain) +
+#   geom_sf()
+
+# We will need to manually trim out some of these areas
+
+# manually remove sections for strait, hood canal (and other inland waters), Grays Harbor, Willapa Bay, Columbia River estuary
+strait <- st_as_sfc(st_bbox(c(xmin=-124.65, xmax=-122, ymin=47.9375, ymax=49), crs = "WGS84"))
+strait_proj <- sf::st_transform(strait, crs = UTM_zone_10_crs)
+strait_proj_km <- st_as_sf(strait_proj/1000, crs = UTM_zone_10_crs)
+
+inland_waters <- st_as_sfc(st_bbox(c(xmin=-123.5, xmax=-120, ymin=44, ymax=49.5), crs = "WGS84"))
+inland_waters_proj <- sf::st_transform(inland_waters, crs = UTM_zone_10_crs)
+inland_waters_proj_km <- st_as_sf(inland_waters_proj/1000, crs = UTM_zone_10_crs)
+
+grays_harbor <- st_as_sfc(st_bbox(c(xmin=-124.15, xmax=-123.6, ymin=46.83, ymax=47.09), crs = "WGS84"))
+grays_harbor_proj <- sf::st_transform(grays_harbor, crs = UTM_zone_10_crs)
+grays_harbor_proj_km <- st_as_sf(grays_harbor_proj/1000, crs = UTM_zone_10_crs)
+
+willapa_bay <- st_as_sfc(st_bbox(c(xmin=-124.06, xmax=-123.5, ymin=46.34, ymax=46.8), crs = "WGS84"))
+willapa_bay_proj <- sf::st_transform(willapa_bay, crs = UTM_zone_10_crs)
+willapa_bay_proj_km <- st_as_sf(willapa_bay_proj/1000, crs = UTM_zone_10_crs)
+
+estuary <- st_as_sfc(st_bbox(c(xmin=-124.02, xmax=-123.5, ymin=46.12, ymax=46.35), crs = "WGS84"))
+estuary_proj <- sf::st_transform(estuary, crs = UTM_zone_10_crs)
+estuary_proj_km <- st_as_sf(estuary_proj/1000, crs = UTM_zone_10_crs)
+
+survey_domain %>% 
+  st_difference(., strait_proj_km) %>% 
+  st_difference(., inland_waters_proj_km) %>% 
+  st_difference(., grays_harbor_proj_km) %>% 
+  st_difference(., willapa_bay_proj_km) %>% 
+  st_difference(., estuary_proj_km) -> survey_domain
+
+# Create a concave hull around points
+st_concave_hull(st_union(survey_domain), ratio = 0.1) -> survey_domain_polygon
+
+# ggplot(survey_domain_polygon) +
+#   geom_sf()
+
+# ggplot(survey_domain) +
+#   geom_sf()
+
+# let's inspect our revised survey domain
+survey_area_basemap_km +
+  geom_sf(data = survey_domain_polygon, fill = "blue", alpha = 0.2)
+
+# Take SST grid and intersect with survey domain
+SST_sf_proj %>% 
+  mutate(geometry = geometry/1000) %>% 
+  st_set_crs(UTM_zone_10_crs) %>% 
+  st_intersection(survey_domain_polygon) %>% 
+  dplyr::select(SST, year, geometry)-> SST_survey_domain
+
+survey_area_basemap_km +
+  geom_sf(data = SST_survey_domain, fill = "blue", alpha = 0.2)
+
+# add in distance from shore - this is now your survey domain, with covariates
+SST_survey_domain %>% 
+  mutate(sf_dist_shore = as.numeric(st_distance(geometry, US_west_coast_proj_km))) -> survey_domain_cov
+survey_domain_cov <- st_as_sf(survey_domain_cov, coords = c("X", "Y"), crs = UTM_zone_10_crs)
+
+
+
+# because the survey_domain_polygon is constructed from a concave hull, some of the borders
+# are a little coarse - and as a result some of the super nearshore data snuck back it.
+# filter it out
+survey_domain_cov %>% 
+  filter(sf_dist_shore >= 0.5) -> survey_domain_cov
+
+
+# extract the grid for the projection area - the grid dimensions are the same each year, so just select one year and drop fields besides geometry
+survey_domain_cov %>% 
+  filter(year == 2016) %>% 
+  dplyr::select(geometry) -> survey_domain_cov_grid
+
+A_gs_rf = fm_evaluator( inla_mesh_cutoff15_jsoes_domain, loc=st_coordinates(survey_domain_cov_grid))$proj$A
+# A_gs_rf = fm_evaluator( inla_mesh_cutoff15_jsoes_domain, loc=st_coordinates(survey_domain_jsoes_cov_grid))$proj$A
+
+# prep anisotropy input
+# note that spatial list replaces the M0, M1, M2 objects 
+spatial_list_rf <- make_anisotropy_spde( inla_mesh_cutoff15_jsoes_domain )
+```
+
+
+
+## Estimate uncertainty for quantities that weren't ADREPORTed
+
+### 05.1_jsoes_bongo_biomass_model
+```{r}
+# If this has already been run before, just load the output instead of running the sample_var code again
+load(here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "estimated_SE_prey_model.rda"))
+SE_pianka_o_csyif_prey_field_t_prey_model <- SE_prey_model$SE_pianka_o_csyif_prey_field_t_prey_model
+SE_pianka_o_cssif_prey_field_t_prey_model <- SE_prey_model$SE_pianka_o_cssif_prey_field_t_prey_model
+
+#### 05.1.1_jsoes_bongo_biomass_SDM ####
+load(here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "jsoes_bongo_biomass_SDM_output.rda"))
+jsoes_bongo_biomass_SDM_Obj <- jsoes_bongo_biomass_SDM_output$jsoes_bongo_biomass_SDM_Obj
+jsoes_bongo_biomass_SDM_Opt <- jsoes_bongo_biomass_SDM_output$jsoes_bongo_biomass_SDM_Opt
+jsoes_bongo_biomass_SDM_report <- jsoes_bongo_biomass_SDM_output$jsoes_bongo_biomass_SDM_report
+# 
+# ### Approximate variance for any quantities that weren't ADREPORTed
+# dyn.load(dynlib(here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "05_1_jsoes_bongo_biomass_SDM")))
+# 
+# # estimate variance for overlap metric for csyif x prey field
+# SE_pianka_o_csyif_prey_field_t_prey_model = sample_var( obj=jsoes_bongo_biomass_SDM_Obj, var_name="pianka_o_csyif_prey_field_t", mu=jsoes_bongo_biomass_SDM_Obj$env$last.par.best, prec=jsoes_bongo_biomass_SDM_Opt$SD$jointPrecision )
+# # estimate variance for overlap metric for cssif x prey field
+# SE_pianka_o_cssif_prey_field_t_prey_model = sample_var( obj=jsoes_bongo_biomass_SDM_Obj, var_name="pianka_o_cssif_prey_field_t", mu=jsoes_bongo_biomass_SDM_Obj$env$last.par.best, prec=jsoes_bongo_biomass_SDM_Opt$SD$jointPrecision )
+# 
+# # Save our estimated SE
+# SE_prey_model <- list(SE_pianka_o_csyif_prey_field_t_prey_model = SE_pianka_o_csyif_prey_field_t_prey_model,
+#                                               SE_pianka_o_cssif_prey_field_t_prey_model = SE_pianka_o_cssif_prey_field_t_prey_model)
+# # 
+# save(SE_prey_model,
+#      file = here::here("R", "05_stage1_SDM", "05.1.1_jsoes_bongo_biomass_SDM", "estimated_SE_prey_model.rda"))
+
+### identify where in our covariance matrix our ADREPORTed variables are
+
+# figure out where in the cov object our variables of interest are
+
+# first extract the summary of the SD
+prey_field_SDM_SD_summary <- summary(jsoes_bongo_biomass_SDM_Opt$SD)
+
+# use this object to figure out what the standard errors are from our variables of interest, and then match them to the cov object
+# csyif index of abundance
+csyif_index_of_abundance_indices <- which(grepl("csyif_index_of_abundance", rownames(prey_field_SDM_SD_summary)))
+csyif_index_of_abundance_cov_indices <- which(sqrt(diag(jsoes_bongo_biomass_SDM_Opt$SD$cov)) %in% prey_field_SDM_SD_summary[csyif_index_of_abundance_indices, "Std. Error"])
+
+# cssif index of abundance
+cssif_index_of_abundance_indices <- which(grepl("cssif_index_of_abundance", rownames(prey_field_SDM_SD_summary)))
+cssif_index_of_abundance_cov_indices <- which(sqrt(diag(jsoes_bongo_biomass_SDM_Opt$SD$cov)) %in% prey_field_SDM_SD_summary[cssif_index_of_abundance_indices, "Std. Error"])
+
+# prey field
+prey_field_index_of_abundance_indices <- which(grepl("prey_field_index_of_abundance", rownames(prey_field_SDM_SD_summary)))
+prey_field_index_of_abundance_cov_indices <- which(sqrt(diag(jsoes_bongo_biomass_SDM_Opt$SD$cov)) %in% prey_field_SDM_SD_summary[prey_field_index_of_abundance_indices, "Std. Error"])
+```
+
+### 05.1.2_rf_model
+```{r}
+# If this has already been run before, just load the output instead of running the sample_var code again
+load(here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "estimated_SE_rf_model.rda"))
+SE_pianka_o_csyif_rf_t_rf_model <- SE_rf_model$SE_pianka_o_csyif_rf_t_rf_model
+SE_pianka_o_cssif_rf_t_rf_model <- SE_rf_model$SE_pianka_o_cssif_rf_t_rf_model
+
+#### 05.1.2_rf_SDM ####
+load(here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "rf_SDM_output.rda"))
+rf_SDM_Obj <- rf_SDM_output$rf_SDM_Obj
+rf_SDM_Opt <- rf_SDM_output$rf_SDM_Opt
+rf_SDM_report <- rf_SDM_output$rf_SDM_report
+# 
+### Approximate variance for any quantities that weren't ADREPORTed
+# dyn.load(dynlib(here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "05_1_rf_SDM")))
+# 
+# # estimate variance for overlap metric for csyif x rf
+# SE_pianka_o_csyif_rf_t_rf_model = sample_var( obj=rf_SDM_Obj, var_name="pianka_o_csyif_rf_t", mu=rf_SDM_Obj$env$last.par.best, prec=rf_SDM_Opt$SD$jointPrecision )
+# # estimate variance for overlap metric for cssif x rf
+# SE_pianka_o_cssif_rf_t_rf_model = sample_var( obj=rf_SDM_Obj, var_name="pianka_o_cssif_rf_t", mu=rf_SDM_Obj$env$last.par.best, prec=rf_SDM_Opt$SD$jointPrecision )
+# 
+# # Save our estimated SE
+# SE_rf_model <- list(SE_pianka_o_csyif_rf_t_rf_model = SE_pianka_o_csyif_rf_t_rf_model,
+#                                               SE_pianka_o_cssif_rf_t_rf_model = SE_pianka_o_cssif_rf_t_rf_model)
+# # 
+# save(SE_rf_model,
+#      file = here::here("R", "05_stage1_SDM", "05.1.2_rf_SDM", "estimated_SE_rf_model.rda"))
+
+### identify where in our covariance matrix our ADREPORTed variables are
+
+# figure out where in the cov object our variables of interest are
+
+# first extract the summary of the SD
+rf_SDM_SD_summary <- summary(rf_SDM_Opt$SD)
+
+# use this object to figure out what the standard errors are from our variables of interest, and then match them to the cov object
+
+# rf
+rf_index_of_abundance_indices <- which(grepl("rf_index_of_abundance", rownames(rf_SDM_SD_summary)))
+rf_index_of_abundance_cov_indices <- which(sqrt(diag(rf_SDM_Opt$SD$cov)) %in% rf_SDM_SD_summary[rf_index_of_abundance_indices, "Std. Error"])
+```
+
+### 05.2_seabird_model
+```{r}
+# If this has already been run before, just load the output instead of running the sample_var code again
+load(here::here("R", "05_stage1_SDM", "05.2_seabird_SDM", "estimated_SE_seabird_model.rda"))
+SE_pianka_o_cssif_sosh_t_seabird_model <- SE_seabird_model$SE_pianka_o_cssif_sosh_t_seabird_model
+SE_pianka_o_cssif_comu_t_seabird_model <- SE_seabird_model$SE_pianka_o_cssif_comu_t_seabird_model
+SE_pianka_o_csyif_sosh_t_seabird_model <- SE_seabird_model$SE_pianka_o_csyif_sosh_t_seabird_model
+SE_pianka_o_csyif_comu_t_seabird_model <- SE_seabird_model$SE_pianka_o_csyif_comu_t_seabird_model
+
+# #### 05.2_seabird_SDM ####
+load(here::here("R", "05_stage1_SDM", "05.2_seabird_SDM", "seabird_SDM_output.rda"))
+seabird_SDM_Obj <- seabird_SDM_output$seabird_SDM_Obj
+seabird_SDM_Opt <- seabird_SDM_output$seabird_SDM_Opt
+seabird_SDM_report <- seabird_SDM_output$seabird_SDM_report
+# 
+# ### Approximate variance for any quantities that weren't ADREPORTed
+# dyn.load(dynlib(here::here("R", "05_stage1_SDM", "05.2_seabird_SDM", "05_2_seabird_SDM_v2")))
+# 
+# # estimate variance for overlap metric for cssif x sosh
+# SE_pianka_o_cssif_sosh_t_seabird_model = sample_var( obj=seabird_SDM_Obj, var_name="pianka_o_cssif_sosh_t", mu=seabird_SDM_Obj$env$last.par.best, prec=seabird_SDM_Opt$SD$jointPrecision)
+# # estimate variance for overlap metric for cssif x comu
+# SE_pianka_o_cssif_comu_t_seabird_model = sample_var( obj=seabird_SDM_Obj, var_name="pianka_o_cssif_comu_t", mu=seabird_SDM_Obj$env$last.par.best, prec=seabird_SDM_Opt$SD$jointPrecision)
+# 
+# # estimate variance for overlap metric for csyif x sosh
+# SE_pianka_o_csyif_sosh_t_seabird_model = sample_var( obj=seabird_SDM_Obj, var_name="pianka_o_csyif_sosh_t", mu=seabird_SDM_Obj$env$last.par.best, prec=seabird_SDM_Opt$SD$jointPrecision)
+# # estimate variance for overlap metric for csyif x comu
+# SE_pianka_o_csyif_comu_t_seabird_model = sample_var( obj=seabird_SDM_Obj, var_name="pianka_o_csyif_comu_t", mu=seabird_SDM_Obj$env$last.par.best, prec=seabird_SDM_Opt$SD$jointPrecision)
+# 
+# # Save our estimated SE
+# SE_seabird_model <- list(SE_pianka_o_cssif_sosh_t_seabird_model = SE_pianka_o_cssif_sosh_t_seabird_model,
+#                                               SE_pianka_o_cssif_comu_t_seabird_model = SE_pianka_o_cssif_comu_t_seabird_model,
+#                                               SE_pianka_o_csyif_sosh_t_seabird_model = SE_pianka_o_csyif_sosh_t_seabird_model,
+#                          SE_pianka_o_csyif_comu_t_seabird_model = SE_pianka_o_csyif_comu_t_seabird_model)
+# 
+# 
+# save(SE_seabird_model,
+#      file = here::here("R", "05_stage1_SDM", "05.2_seabird_SDM", "estimated_SE_seabird_model.rda"))
+
+
+
+### identify where in our covariance matrix our ADREPORTed variables are
+
+# figure out where in the cov object our variables of interest are
+
+# first extract the summary of the SD
+seabird_SDM_SD_summary <- summary(seabird_SDM_Opt$SD)
+
+# use this object to figure out what the standard errors are from our variables of interest, and then match them to the cov object
+# comu index of abundance
+comu_index_of_abundance_indices <- which(grepl("comu_index_of_abundance", rownames(seabird_SDM_SD_summary)))
+comu_index_of_abundance_cov_indices <- which(sqrt(diag(seabird_SDM_Opt$SD$cov)) %in% seabird_SDM_SD_summary[comu_index_of_abundance_indices, "Std. Error"])
+
+sosh_index_of_abundance_indices <- which(grepl("sosh_index_of_abundance", rownames(seabird_SDM_SD_summary)))
+sosh_index_of_abundance_cov_indices <- which(sqrt(diag(seabird_SDM_Opt$SD$cov)) %in% seabird_SDM_SD_summary[sosh_index_of_abundance_indices, "Std. Error"])
+```
+
+
+
+# Fit SAR model - prey and seabirds
+
+### Prepare UC and SR SAR data
+
+```{r prep_SAR_data}
+common_years_seabird_prey <- intersect(intersect(unique(csyif$year), # jsoes trawl
+                          unique(jsoes_bongo_biomass_cancer_crab_larvae$year)), # jsoes bongo
+                          intersect(unique(rf$year), # PRS/PWCC
+                          unique(sosh$year)))
+
+common_years_prey <- intersect(
+                          unique(jsoes_bongo_biomass_cancer_crab_larvae$year), # jsoes bongo
+                          unique(rf$year) # PRS/PWCC
+                          )
+
+# load the SAR data
+SAR_data <- read.csv(here::here("model_inputs", "chinook_det_hist.csv"))
+
+# subset to only the common years
+SAR_data <- subset(SAR_data, run_year %in% common_years_seabird_prey)
+
+# quick look at data
+table(SAR_data$run_name, SAR_data$group)
+
+# inspect distribution of outmigration timing
+
+SAR_data %>% 
+  mutate(BON_juv_det_date = substr(BON_juv_det_time, 1, 10)) %>% 
+  mutate(BON_juv_det_date = ymd(BON_juv_det_date)) %>% 
+  mutate(outmigration_date = yday(BON_juv_det_date)) -> SAR_data
+
+# plot distribution of outmigration timing
+outmigration_timing_plot <- ggplot(SAR_data, aes(x = outmigration_date)) +
+  geom_histogram() +
+  facet_wrap(~group + run_name)
+
+ggsave(here::here("figures", "outmigration_timing_plot_by_group.png"), outmigration_timing_plot,
+       height = 12, width = 12)
+
+
+# inspect distribution of years with adult returns
+subset(SAR_data, adult_det == 1) -> SAR_adult_det
+
+adult_returns_plot <- ggplot(SAR_adult_det, aes(x = run_year)) +
+  geom_histogram(breaks = seq(1998, 2025, 1)) +
+  facet_wrap(~group + run_name)
+
+ggsave(here::here("figures", "adult_returns_plot.png"), adult_returns_plot,
+       height = 12, width = 12)
+
+SAR_adult_det %>% 
+  group_by(group, run_name, run_year) %>% 
+  summarise(N = sum(adult_det)) -> adult_det_by_year
+
+#### Snake River Fall Chinook ####
+
+# extract Snake River Fall Chinook from SAR data
+SRF <- subset(SAR_data, run_name == "Fall" & group == "Snake River")
+
+#### subset by outmigration date
+hist(SRF$outmigration_date)
+summary(SRF$outmigration_date)
+
+# restrict the analysis to fish that could have theoretically been caught in the June JSOES survey.
+# we will call this April 15 - June 15 (for now!)
+# day 105 is April 15 in a non-leap year and day 167 is June 15 in a leap year
+# SRF_subset <- filter(SRF, outmigration_date >= 105 & outmigration_date <= 167)
+
+# let's just have a final cutoff - based on the fact that fish can hang out
+# off the coast for a while, it's less justified to have a front-end cutoff date
+SRF_subset <- filter(SRF, outmigration_date <= 167)
+nrow(SRF_subset)/nrow(SRF)
+# this leaves us with 54% of our initial dataset
+
+
+#### Join with the transport data
+
+transport_data_export <- read.csv(here::here("model_inputs", "chinook_transport.csv"))
+
+# join the juvenile transport data with the SAR data
+SRF_subset %>% 
+  left_join(transport_data_export, join_by(tag_code == tag_id)) -> SRF_subset
+
+SRF_subset$transport[is.na(SRF_subset$transport)] <- 0
+
+# inspect number of transported fish
+table(SRF_subset$transport)
+
+
+#### Drop the few natural origin fish
+
+# fish with rear type U or H are hatchery fish
+SRF_subset %>% 
+  mutate(rear_numeric = ifelse(rear_type_code %in% c("H", "U"), 1, 0)) -> SRF_subset
+
+# ok, so they're all hatchery. That's perhaps not surprising, given what we see in the JSOES survey is basically all hatchery
+# Let's only keep hatchery fish
+SRF_subset <- subset(SRF_subset, rear_type_code != "W")
+
+
+#### Upper Columbia Summer/Fall Chinook ####
+
+# extract Snake River Fall Chinook from SAR data
+UCSF <- subset(SAR_data, run_name %in% c("Summer", "Fall") & group == "Upper Columbia")
+
+#### subset by outmigration date
+hist(UCSF$outmigration_date)
+summary(UCSF$outmigration_date)
+
+# restrict the analysis to fish that could have theoretically been caught in the June JSOES survey.
+# we will call this April 15 - June 15 (for now!)
+# day 105 is April 15 in a non-leap year and day 167 is June 15 in a leap year
+# UCSF_subset <- filter(UCSF, outmigration_date >= 105 & outmigration_date <= 167)
+
+# let's just have a final cutoff - based on the fact that fish can hang out
+# off the coast for a while, it's less justified to have a front-end cutoff date
+UCSF_subset <- filter(UCSF, outmigration_date <= 167)
+nrow(UCSF_subset)/nrow(UCSF)
+# this leaves us with 72% of our initial dataset
+
+#### Drop the few natural origin fish (28 of ~97,500)
+
+table(UCSF_subset$rear_type_code)
+
+# fish with rear type U or H are hatchery fish
+UCSF_subset %>% 
+  mutate(rear_numeric = ifelse(rear_type_code %in% c("H", "U"), 1, 0)) -> UCSF_subset
+
+# ok, so they're all hatchery. That's perhaps not surprising, given what we see in the JSOES survey is basically all hatchery
+# Let's only keep hatchery fish
+UCSF_subset <- subset(UCSF_subset, rear_type_code != "W")
+
+# set transport to 0 for UCSF fish
+UCSF_subset$transport <- 0
+
+# JOIN SRF AND UCSF TOGETHER
+bind_rows(SRF_subset, UCSF_subset) -> interior_subset
+```
+
+### Set up predictors for SAR model
+
+#### Predictor estimates
+```{r}
+#### combine all predictors into a data frame ####
+## prey model outputs
+csyif_index_of_abundance_df <- data.frame(year = sort(unique(csyif$year)),
+                                          csyif_index_of_abundance = jsoes_bongo_biomass_SDM_report$csyif_index_of_abundance)
+cssif_index_of_abundance_df <- data.frame(year = sort(unique(cssif$year)),
+                                          cssif_index_of_abundance = jsoes_bongo_biomass_SDM_report$cssif_index_of_abundance)
+
+# jsoes bongo biomass prey field
+prey_field_index_of_abundance_df <- data.frame(year = unique(jsoes_bongo_biomass_cancer_crab_larvae$year),
+                                               prey_field_index_of_abundance = jsoes_bongo_biomass_SDM_report$prey_field_index_of_abundance)
+pianka_o_csyif_prey_field_df <- data.frame(year = unique(jsoes_bongo_biomass_cancer_crab_larvae$year),
+                                           pianka_o_csyif_prey_field_t = jsoes_bongo_biomass_SDM_report$pianka_o_csyif_prey_field_t)
+pianka_o_cssif_prey_field_df <- data.frame(year = unique(jsoes_bongo_biomass_cancer_crab_larvae$year),
+                                           pianka_o_cssif_prey_field_t = jsoes_bongo_biomass_SDM_report$pianka_o_cssif_prey_field_t)
+
+# rf
+rf_index_of_abundance_df <- data.frame(year = unique(rf$year),
+                                       rf_index_of_abundance = rf_SDM_report$rf_index_of_abundance)
+pianka_o_csyif_rf_df <- data.frame(year = unique(rf$year),
+                                   pianka_o_csyif_rf_t = rf_SDM_report$pianka_o_csyif_rf_t)
+pianka_o_cssif_rf_df <- data.frame(year = unique(rf$year),
+                                   pianka_o_cssif_rf_t = rf_SDM_report$pianka_o_cssif_rf_t)
+
+## seabird model outputs
+comu_index_of_abundance_df <- data.frame(year = sort(unique(comu$year)),
+                                         comu_index_of_abundance = seabird_SDM_report$comu_index_of_abundance)
+sosh_index_of_abundance_df <- data.frame(year = min(sosh$year):max(sosh$year),
+                                         sosh_index_of_abundance = seabird_SDM_report$sosh_index_of_abundance)
+pianka_o_csyif_comu_df <- data.frame(year = sort(unique(comu$year)),
+                                     pianka_o_csyif_comu_t = seabird_SDM_report$pianka_o_csyif_comu_t)
+pianka_o_csyif_sosh_df <- data.frame(year = sort(unique(sosh$year)),
+                                     pianka_o_csyif_sosh_t = seabird_SDM_report$pianka_o_csyif_sosh_t)
+pianka_o_cssif_comu_df <- data.frame(year = sort(unique(comu$year)),
+                                     pianka_o_cssif_comu_t = seabird_SDM_report$pianka_o_cssif_comu_t)
+pianka_o_cssif_sosh_df <- data.frame(year = sort(unique(sosh$year)),
+                                     pianka_o_cssif_sosh_t = seabird_SDM_report$pianka_o_cssif_sosh_t)
+
+
+csyif_index_of_abundance_df %>% 
+  left_join(cssif_index_of_abundance_df, by = "year") %>% 
+  left_join(prey_field_index_of_abundance_df, by = "year") %>% 
+  left_join(pianka_o_csyif_prey_field_df, by = "year") %>% 
+  left_join(pianka_o_cssif_prey_field_df, by = "year") %>%  
+  left_join(rf_index_of_abundance_df, by = "year") %>% 
+  left_join(pianka_o_csyif_rf_df, by = "year") %>% 
+  left_join(pianka_o_cssif_rf_df, by = "year") %>%  
+  left_join(comu_index_of_abundance_df, by = "year") %>% 
+  left_join(sosh_index_of_abundance_df, by = "year") %>% 
+  left_join(pianka_o_csyif_comu_df, by = "year") %>% 
+  left_join(pianka_o_csyif_sosh_df, by = "year") %>% 
+  left_join(pianka_o_cssif_comu_df, by = "year") %>% 
+  left_join(pianka_o_cssif_sosh_df, by = "year") -> SDM_predictors_df
+```
+
+
+#### Predictor uncertainty
+```{r}
+
+#### Trim variance terms to common years ####
+
+# APPROXIMATE STANDARD ERRORS
+names(SE_pianka_o_csyif_prey_field_t_prey_model) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+names(SE_pianka_o_cssif_prey_field_t_prey_model) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+
+names(SE_pianka_o_csyif_rf_t_rf_model) <- unique(rf$year)
+names(SE_pianka_o_cssif_rf_t_rf_model) <- unique(rf$year)
+
+names(SE_pianka_o_cssif_sosh_t_seabird_model) <- sort(unique(sosh$year))
+names(SE_pianka_o_cssif_comu_t_seabird_model) <- sort(unique(sosh$year))
+names(SE_pianka_o_csyif_sosh_t_seabird_model) <- sort(unique(sosh$year))
+names(SE_pianka_o_csyif_comu_t_seabird_model) <- sort(unique(sosh$year))
+
+SE_pianka_o_csyif_prey_field_t_prey_model_common_years_seabird_prey <- SE_pianka_o_csyif_prey_field_t_prey_model[which(names(SE_pianka_o_csyif_prey_field_t_prey_model) %in% common_years_seabird_prey)]
+SE_pianka_o_cssif_prey_field_t_prey_model_common_years_seabird_prey <- SE_pianka_o_cssif_prey_field_t_prey_model[which(names(SE_pianka_o_cssif_prey_field_t_prey_model) %in% common_years_seabird_prey)]
+
+SE_pianka_o_csyif_rf_t_rf_model_common_years_seabird_prey <- SE_pianka_o_csyif_rf_t_rf_model[which(names(SE_pianka_o_csyif_rf_t_rf_model) %in% common_years_seabird_prey)]
+SE_pianka_o_cssif_rf_t_rf_model_common_years_seabird_prey <- SE_pianka_o_cssif_rf_t_rf_model[which(names(SE_pianka_o_cssif_rf_t_rf_model) %in% common_years_seabird_prey)]
+
+SE_pianka_o_cssif_sosh_t_seabird_model_common_years_seabird_prey <- SE_pianka_o_cssif_sosh_t_seabird_model[which(names(SE_pianka_o_cssif_sosh_t_seabird_model) %in% common_years_seabird_prey)]
+SE_pianka_o_cssif_comu_t_seabird_model_common_years_seabird_prey <- SE_pianka_o_cssif_comu_t_seabird_model[which(names(SE_pianka_o_cssif_comu_t_seabird_model) %in% common_years_seabird_prey)]
+SE_pianka_o_csyif_sosh_t_seabird_model_common_years_seabird_prey <- SE_pianka_o_csyif_sosh_t_seabird_model[which(names(SE_pianka_o_csyif_sosh_t_seabird_model) %in% common_years_seabird_prey)]
+SE_pianka_o_csyif_comu_t_seabird_model_common_years_seabird_prey <- SE_pianka_o_csyif_comu_t_seabird_model[which(names(SE_pianka_o_csyif_comu_t_seabird_model) %in% common_years_seabird_prey)]
+
+
+
+# APPROXIMATE STANDARD ERRORS - as diagonals in covariance matrices
+# csyif x prey (JSOES bongo biomass) overlap
+pianka_o_csyif_prey_field_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_csyif_prey_field_t_prey_model),
+                                               ncol = length(SE_pianka_o_csyif_prey_field_t_prey_model))
+diag(pianka_o_csyif_prey_field_cov_matrix) <- SE_pianka_o_csyif_prey_field_t_prey_model^2
+rownames(pianka_o_csyif_prey_field_cov_matrix) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+colnames(pianka_o_csyif_prey_field_cov_matrix) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+
+pianka_o_csyif_prey_field_cov_matrix_common_years_seabird_prey <- pianka_o_csyif_prey_field_cov_matrix[which(rownames(pianka_o_csyif_prey_field_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_csyif_prey_field_cov_matrix) %in% common_years_seabird_prey)]
+
+# cssif x prey (JSOES bongo biomass) overlap
+pianka_o_cssif_prey_field_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_cssif_prey_field_t_prey_model),
+                                               ncol = length(SE_pianka_o_cssif_prey_field_t_prey_model))
+diag(pianka_o_cssif_prey_field_cov_matrix) <- SE_pianka_o_cssif_prey_field_t_prey_model^2
+rownames(pianka_o_cssif_prey_field_cov_matrix) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+colnames(pianka_o_cssif_prey_field_cov_matrix) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+
+pianka_o_cssif_prey_field_cov_matrix_common_years_seabird_prey <- pianka_o_cssif_prey_field_cov_matrix[which(rownames(pianka_o_cssif_prey_field_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_cssif_prey_field_cov_matrix) %in% common_years_seabird_prey)]
+
+# csyif x rf overlap
+pianka_o_csyif_rf_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_csyif_rf_t_rf_model),
+                                       ncol = length(SE_pianka_o_csyif_rf_t_rf_model))
+diag(pianka_o_csyif_rf_cov_matrix) <- SE_pianka_o_csyif_rf_t_rf_model^2
+rownames(pianka_o_csyif_rf_cov_matrix) <- unique(rf$year)
+colnames(pianka_o_csyif_rf_cov_matrix) <- unique(rf$year)
+
+pianka_o_csyif_rf_cov_matrix_common_years_seabird_prey <- pianka_o_csyif_rf_cov_matrix[which(rownames(pianka_o_csyif_rf_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_csyif_rf_cov_matrix) %in% common_years_seabird_prey)]
+
+# cssif x rf overlap
+pianka_o_cssif_rf_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_cssif_rf_t_rf_model),
+                                       ncol = length(SE_pianka_o_cssif_rf_t_rf_model))
+diag(pianka_o_cssif_rf_cov_matrix) <- SE_pianka_o_cssif_rf_t_rf_model^2
+rownames(pianka_o_cssif_rf_cov_matrix) <- unique(rf$year)
+colnames(pianka_o_cssif_rf_cov_matrix) <- unique(rf$year)
+
+pianka_o_cssif_rf_cov_matrix_common_years_seabird_prey <- pianka_o_cssif_rf_cov_matrix[which(rownames(pianka_o_cssif_rf_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_cssif_rf_cov_matrix) %in% common_years_seabird_prey)]
+
+# cssif x sosh overlap
+pianka_o_cssif_sosh_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_cssif_sosh_t_seabird_model),
+                                         ncol = length(SE_pianka_o_cssif_sosh_t_seabird_model))
+diag(pianka_o_cssif_sosh_cov_matrix) <- SE_pianka_o_cssif_sosh_t_seabird_model^2
+rownames(pianka_o_cssif_sosh_cov_matrix) <- sort(unique(sosh$year))
+colnames(pianka_o_cssif_sosh_cov_matrix) <- sort(unique(sosh$year))
+
+pianka_o_cssif_sosh_cov_matrix_common_years_seabird_prey <- pianka_o_cssif_sosh_cov_matrix[which(rownames(pianka_o_cssif_sosh_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_cssif_sosh_cov_matrix) %in% common_years_seabird_prey)]
+
+# cssif x comu overlap
+pianka_o_cssif_comu_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_cssif_comu_t_seabird_model),
+                                         ncol = length(SE_pianka_o_cssif_comu_t_seabird_model))
+diag(pianka_o_cssif_comu_cov_matrix) <- SE_pianka_o_cssif_comu_t_seabird_model^2
+rownames(pianka_o_cssif_comu_cov_matrix) <- sort(unique(sosh$year))
+colnames(pianka_o_cssif_comu_cov_matrix) <- sort(unique(sosh$year))
+
+pianka_o_cssif_comu_cov_matrix_common_years_seabird_prey <- pianka_o_cssif_comu_cov_matrix[which(rownames(pianka_o_cssif_comu_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_cssif_comu_cov_matrix) %in% common_years_seabird_prey)]
+
+# csyif x sosh overlap
+pianka_o_csyif_sosh_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_csyif_sosh_t_seabird_model),
+                                         ncol = length(SE_pianka_o_csyif_sosh_t_seabird_model))
+diag(pianka_o_csyif_sosh_cov_matrix) <- SE_pianka_o_csyif_sosh_t_seabird_model^2
+rownames(pianka_o_csyif_sosh_cov_matrix) <- sort(unique(sosh$year))
+colnames(pianka_o_csyif_sosh_cov_matrix) <- sort(unique(sosh$year))
+
+pianka_o_csyif_sosh_cov_matrix_common_years_seabird_prey <- pianka_o_csyif_sosh_cov_matrix[which(rownames(pianka_o_csyif_sosh_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_csyif_sosh_cov_matrix) %in% common_years_seabird_prey)]
+
+# csyif x comu overlap
+pianka_o_csyif_comu_cov_matrix <- matrix(data = 0, nrow = length(SE_pianka_o_csyif_comu_t_seabird_model),
+                                         ncol = length(SE_pianka_o_csyif_comu_t_seabird_model))
+diag(pianka_o_csyif_comu_cov_matrix) <- SE_pianka_o_csyif_comu_t_seabird_model^2
+rownames(pianka_o_csyif_comu_cov_matrix) <- sort(unique(sosh$year))
+colnames(pianka_o_csyif_comu_cov_matrix) <- sort(unique(sosh$year))
+
+pianka_o_csyif_comu_cov_matrix_common_years_seabird_prey <- pianka_o_csyif_comu_cov_matrix[which(rownames(pianka_o_csyif_comu_cov_matrix) %in% common_years_seabird_prey), which(colnames(pianka_o_csyif_comu_cov_matrix) %in% common_years_seabird_prey)]
+
+
+
+
+# COVARIANCE MATRICES
+
+#### trim variance terms from prey field model to common years for joint seabird + prey model
+csyif_index_of_abundance_cov_matrix <- as.matrix(jsoes_bongo_biomass_SDM_Opt$SD$cov[csyif_index_of_abundance_cov_indices, csyif_index_of_abundance_cov_indices])
+colnames(csyif_index_of_abundance_cov_matrix) <- sort(unique(csyif$year))
+rownames(csyif_index_of_abundance_cov_matrix) <- sort(unique(csyif$year))
+
+csyif_index_of_abundance_cov_matrix_common_years_seabird_prey <- csyif_index_of_abundance_cov_matrix[which(rownames(csyif_index_of_abundance_cov_matrix) %in% common_years_seabird_prey), which(colnames(csyif_index_of_abundance_cov_matrix) %in% common_years_seabird_prey)]
+
+cssif_index_of_abundance_cov_matrix <- as.matrix(jsoes_bongo_biomass_SDM_Opt$SD$cov[cssif_index_of_abundance_cov_indices, cssif_index_of_abundance_cov_indices])
+colnames(cssif_index_of_abundance_cov_matrix) <- sort(unique(cssif$year))
+rownames(cssif_index_of_abundance_cov_matrix) <- sort(unique(cssif$year))
+
+cssif_index_of_abundance_cov_matrix_common_years_seabird_prey <- cssif_index_of_abundance_cov_matrix[which(rownames(cssif_index_of_abundance_cov_matrix) %in% common_years_seabird_prey), which(colnames(cssif_index_of_abundance_cov_matrix) %in% common_years_seabird_prey)]
+
+prey_field_index_of_abundance_cov_matrix <- as.matrix(jsoes_bongo_biomass_SDM_Opt$SD$cov[prey_field_index_of_abundance_cov_indices, prey_field_index_of_abundance_cov_indices])
+colnames(prey_field_index_of_abundance_cov_matrix) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+rownames(prey_field_index_of_abundance_cov_matrix) <- unique(jsoes_bongo_biomass_cancer_crab_larvae$year)
+
+prey_field_index_of_abundance_cov_matrix_common_years_seabird_prey <- prey_field_index_of_abundance_cov_matrix[which(rownames(prey_field_index_of_abundance_cov_matrix) %in% common_years_seabird_prey), which(colnames(prey_field_index_of_abundance_cov_matrix) %in% common_years_seabird_prey)]
+
+rf_index_of_abundance_cov_matrix <- as.matrix(rf_SDM_Opt$SD$cov[rf_index_of_abundance_cov_indices, rf_index_of_abundance_cov_indices])
+colnames(rf_index_of_abundance_cov_matrix) <- unique(rf$year)
+rownames(rf_index_of_abundance_cov_matrix) <- unique(rf$year)
+
+rf_index_of_abundance_cov_matrix_common_years_seabird_prey <- rf_index_of_abundance_cov_matrix[which(rownames(rf_index_of_abundance_cov_matrix) %in% common_years_seabird_prey), which(colnames(rf_index_of_abundance_cov_matrix) %in% common_years_seabird_prey)]
+
+#### trim variance terms from seabird model to common years for joint seabird + prey model
+comu_index_of_abundance_cov_matrix <- as.matrix(seabird_SDM_Opt$SD$cov[comu_index_of_abundance_cov_indices, comu_index_of_abundance_cov_indices])
+colnames(comu_index_of_abundance_cov_matrix) <- sort(unique(comu$year))
+rownames(comu_index_of_abundance_cov_matrix) <- sort(unique(comu$year))
+
+comu_index_of_abundance_cov_matrix_common_years_seabird_prey <- comu_index_of_abundance_cov_matrix[which(rownames(comu_index_of_abundance_cov_matrix) %in% common_years_seabird_prey), which(colnames(comu_index_of_abundance_cov_matrix) %in% common_years_seabird_prey)]
+
+sosh_index_of_abundance_cov_matrix <- as.matrix(seabird_SDM_Opt$SD$cov[sosh_index_of_abundance_cov_indices, sosh_index_of_abundance_cov_indices])
+colnames(sosh_index_of_abundance_cov_matrix) <- min(sosh$year):max(sosh$year)
+rownames(sosh_index_of_abundance_cov_matrix) <- min(sosh$year):max(sosh$year)
+
+sosh_index_of_abundance_cov_matrix_common_years_seabird_prey <- sosh_index_of_abundance_cov_matrix[which(rownames(sosh_index_of_abundance_cov_matrix) %in% common_years_seabird_prey), which(colnames(sosh_index_of_abundance_cov_matrix) %in% common_years_seabird_prey)]
+
+# check for collinearity
+cor(dplyr::select(subset(SDM_predictors_df, !(is.na(comu_index_of_abundance)) & !(is.na(rf_index_of_abundance))), -year)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("var1") %>% 
+  pivot_longer(cols = -c(var1), names_to = "var2") %>% 
+  filter(var1 != var2) %>% 
+  arrange(desc(value))
+# none of the predictors that we are including in the same model are above the 0.7 threshold
+```
+
+
+### Fit model for interior - z-scored
+
+#### Version 1 - only CSYIF as predictors - but using sample_var estimated SEs as diagonals in covariance matrix
+```{r}
+# trim the SAR data to only the years of the SDM data
+interior_v1_data_prey_seabirds <- subset(interior_subset, run_year %in% common_years_seabird_prey)
+
+# calculate outmigration date separately for UCSF and SRF
+mean_SRF_outmigration_date <- mean(subset(interior_v1_data_prey_seabirds, group == "Snake River")$outmigration_date)
+
+mean_UCSF_outmigration_date <- mean(subset(interior_v1_data_prey_seabirds, group == "Upper Columbia")$outmigration_date)
+
+interior_v1_data_prey_seabirds %>% 
+  mutate(outmigration_scaled = ifelse(group == "Snake River", outmigration_date - mean_SRF_outmigration_date,
+                                      ifelse(group == "Upper Columbia", outmigration_date - mean_UCSF_outmigration_date, NA))) -> interior_v1_data_prey_seabirds
+
+# create new indicators for group x transport
+interior_v1_data_prey_seabirds %>% 
+  mutate(SRF_transported_i = ifelse(group == "Snake River" & transport == 1, 1, 0)) %>% 
+  mutate(SRF_non_transported_i = ifelse(group == "Snake River" & transport == 0, 1, 0)) %>% 
+  mutate(UCSF_i = ifelse(group == "Upper Columbia", 1, 0)) -> interior_v1_data_prey_seabirds
+
+# trim the predictors df to only the years in common
+interior_v1_seabird_prey_predictors <- subset(SDM_predictors_df, year %in% common_years_seabird_prey)
+
+compile(here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov.cpp"))
+dyn.load(dynlib(here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov")))
+
+interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data = list(
+  ## SAR data
+  "z_i" = interior_v1_data_prey_seabirds$adult_det, 
+  "t_i" = as.integer(dplyr::dense_rank(interior_v1_data_prey_seabirds$run_year - min(interior_v1_data_prey_seabirds$run_year))-1),
+  "n_t" = length(unique(interior_v1_data_prey_seabirds$run_year)),
+  "SRF_transported_i" = interior_v1_data_prey_seabirds$SRF_transported_i,
+  "SRF_non_transported_i" = interior_v1_data_prey_seabirds$SRF_non_transported_i,
+  "UCSF_i" = interior_v1_data_prey_seabirds$UCSF_i,
+  "outmigration_i" = interior_v1_data_prey_seabirds$outmigration_scaled,
+  
+  ## indices of abundance from stage 1 model
+  # "csyif_index_t" = (interior_v1_seabird_prey_predictors$csyif_index_of_abundance - mean(interior_v1_seabird_prey_predictors$csyif_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$csyif_index_of_abundance),
+  "prey_field_index_t" = (interior_v1_seabird_prey_predictors$prey_field_index_of_abundance - mean(interior_v1_seabird_prey_predictors$prey_field_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$prey_field_index_of_abundance),
+  "rf_index_t" = (interior_v1_seabird_prey_predictors$rf_index_of_abundance - mean(interior_v1_seabird_prey_predictors$rf_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$rf_index_of_abundance),
+  "comu_index_t" = (interior_v1_seabird_prey_predictors$comu_index_of_abundance - mean(interior_v1_seabird_prey_predictors$comu_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$comu_index_of_abundance),
+  "sosh_index_t" = (interior_v1_seabird_prey_predictors$sosh_index_of_abundance - mean(interior_v1_seabird_prey_predictors$sosh_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$sosh_index_of_abundance),
+  
+  ## overlap metrics from stage 1 model
+  "pianka_o_csyif_prey_field_t" = (interior_v1_seabird_prey_predictors$pianka_o_csyif_prey_field_t - mean(interior_v1_seabird_prey_predictors$pianka_o_csyif_prey_field_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_prey_field_t),
+  "pianka_o_csyif_rf_t" = (interior_v1_seabird_prey_predictors$pianka_o_csyif_rf_t - mean(interior_v1_seabird_prey_predictors$pianka_o_csyif_rf_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_rf_t),
+  "pianka_o_csyif_sosh_t" = (interior_v1_seabird_prey_predictors$pianka_o_csyif_sosh_t - mean(interior_v1_seabird_prey_predictors$pianka_o_csyif_sosh_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_sosh_t),
+  "pianka_o_csyif_comu_t" = (interior_v1_seabird_prey_predictors$pianka_o_csyif_comu_t - mean(interior_v1_seabird_prey_predictors$pianka_o_csyif_comu_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_comu_t),
+  
+  # uncertainty for indices of abundance and overlap metrics
+  # "Sigma_csyif_index_t" = csyif_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$csyif_index_of_abundance))^2,
+  "Sigma_prey_field_index_t" = prey_field_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$prey_field_index_of_abundance))^2,
+  "Sigma_rf_index_t" = rf_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$rf_index_of_abundance))^2,
+  "Sigma_comu_index_t" = comu_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$comu_index_of_abundance))^2,
+  "Sigma_sosh_index_t" = sosh_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$sosh_index_of_abundance))^2,
+  
+  "Sigma_pianka_o_csyif_prey_field_t" = pianka_o_csyif_prey_field_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_prey_field_t))^2,
+  "Sigma_pianka_o_csyif_rf_t" = pianka_o_csyif_rf_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_rf_t))^2,
+  "Sigma_pianka_o_csyif_sosh_t" = pianka_o_csyif_sosh_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_sosh_t))^2,
+  "Sigma_pianka_o_csyif_comu_t" = pianka_o_csyif_comu_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_csyif_comu_t))^2
+)
+
+interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Params <- list(
+  ## SAR parameters
+  "beta_UCSF" = 0, # intercept term for UCSF
+  "beta_SRF_transported" = 0, # intercept term for SRF transported
+  "beta_SRF_non_transported" = 0, # intercept term for SRF non-transported
+  
+  "beta_outmigration_SRF" = 0,
+  "beta_outmigration_SRF2" = 0,
+  "beta_outmigration_UCSF" = 0,
+  "beta_outmigration_UCSF2" = 0,
+  
+  # "beta_csyif_index" = 0, # term to account for abundance in the survey
+  
+  # parameters for the influence of abundance of prey/predators
+  "beta_prey_field_index" = 0,
+  "beta_rf_index" = 0,
+  "beta_comu_index" = 0,
+  "beta_sosh_index" = 0,
+  
+  # parameters for the influence of overlap with prey/predators
+  "beta_ov_prey_field" = 0,
+  "beta_ov_rf" = 0,
+  "beta_ov_comu" = 0,
+  "beta_ov_sosh" = 0,
+  
+  # EiV latent variables (random effects)
+  # "csyif_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$csyif_index_t)),
+  "prey_field_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$prey_field_index_t)),
+  "pianka_o_csyif_prey_field_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$pianka_o_csyif_prey_field_t)),
+  "rf_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$rf_index_t)),
+  "pianka_o_csyif_rf_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$pianka_o_csyif_rf_t)),
+  "sosh_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$sosh_index_t)),
+  "pianka_o_csyif_sosh_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$pianka_o_csyif_sosh_t)),
+  "comu_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$comu_index_t)),
+  "pianka_o_csyif_comu_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data$pianka_o_csyif_comu_t))
+  
+)
+
+# save workspace, in case model crashes
+# save.image(here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_workspace.rda"))
+# load("hake_SAR_workspace.RData")
+
+interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj = MakeADFun( data=interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Data, 
+                                                              parameters=interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Params, 
+                                                              random= c(# "csyif_index_t_latent", 
+                                                                "prey_field_index_t_latent", 
+                                                                "pianka_o_csyif_prey_field_t_latent",
+                                                                "rf_index_t_latent", 
+                                                                "pianka_o_csyif_rf_t_latent",
+                                                                "sosh_index_t_latent",
+                                                                "pianka_o_csyif_sosh_t_latent",
+                                                                "comu_index_t_latent",
+                                                                "pianka_o_csyif_comu_t_latent"),
+                                                              DLL = "06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov")
+
+
+# Optimize
+interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Opt = nlminb( start=interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj$par, obj=interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj$fn, grad=interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj$gr )
+interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Opt$SD = sdreport( interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj)
+interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_report = interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj$report()
+
+interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_output <- list(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj = interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Obj,
+                                                            interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Opt = interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_Opt,
+                                                            interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_report = interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_report)
+
+
+save(interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_output,
+     file = here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "interior_06_2_6_seabird_prey_csyif_only_one_model_SAR_SEcov_output_zscored.rda"))
+```
+
+#### Version 2 - only CSSIF as predictors - but using sample_var estimated SEs as diagonals in covariance matrix
+```{r}
+# trim the SAR data to only the years of the SDM data
+interior_v1_data_prey_seabirds <- subset(interior_subset, run_year %in% common_years_seabird_prey)
+
+# calculate outmigration date separately for UCSF and SRF
+mean_SRF_outmigration_date <- mean(subset(interior_v1_data_prey_seabirds, group == "Snake River")$outmigration_date)
+
+mean_UCSF_outmigration_date <- mean(subset(interior_v1_data_prey_seabirds, group == "Upper Columbia")$outmigration_date)
+
+interior_v1_data_prey_seabirds %>% 
+  mutate(outmigration_scaled = ifelse(group == "Snake River", outmigration_date - mean_SRF_outmigration_date,
+                                      ifelse(group == "Upper Columbia", outmigration_date - mean_UCSF_outmigration_date, NA))) -> interior_v1_data_prey_seabirds
+
+# create new indicators for group x transport
+interior_v1_data_prey_seabirds %>% 
+  mutate(SRF_transported_i = ifelse(group == "Snake River" & transport == 1, 1, 0)) %>% 
+  mutate(SRF_non_transported_i = ifelse(group == "Snake River" & transport == 0, 1, 0)) %>% 
+  mutate(UCSF_i = ifelse(group == "Upper Columbia", 1, 0)) -> interior_v1_data_prey_seabirds
+
+
+# trim the predictors df to only the years in common
+interior_v1_seabird_prey_predictors <- subset(SDM_predictors_df, year %in% common_years_seabird_prey)
+
+compile(here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov.cpp"))
+dyn.load(dynlib(here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov")))
+
+interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data = list(
+  ## SAR data
+  "z_i" = interior_v1_data_prey_seabirds$adult_det, 
+  "t_i" = as.integer(dplyr::dense_rank(interior_v1_data_prey_seabirds$run_year - min(interior_v1_data_prey_seabirds$run_year))-1),
+  "n_t" = length(unique(interior_v1_data_prey_seabirds$run_year)),
+  "SRF_transported_i" = interior_v1_data_prey_seabirds$SRF_transported_i,
+  "SRF_non_transported_i" = interior_v1_data_prey_seabirds$SRF_non_transported_i,
+  "UCSF_i" = interior_v1_data_prey_seabirds$UCSF_i,
+  "outmigration_i" = interior_v1_data_prey_seabirds$outmigration_scaled,
+  
+  ## indices of abundance from stage 1 model
+  # "cssif_index_t" = (interior_v1_seabird_prey_predictors$cssif_index_of_abundance - mean(interior_v1_seabird_prey_predictors$cssif_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$cssif_index_of_abundance),
+  "prey_field_index_t" = (interior_v1_seabird_prey_predictors$prey_field_index_of_abundance - mean(interior_v1_seabird_prey_predictors$prey_field_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$prey_field_index_of_abundance),
+  "rf_index_t" = (interior_v1_seabird_prey_predictors$rf_index_of_abundance - mean(interior_v1_seabird_prey_predictors$rf_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$rf_index_of_abundance),
+  "comu_index_t" = (interior_v1_seabird_prey_predictors$comu_index_of_abundance - mean(interior_v1_seabird_prey_predictors$comu_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$comu_index_of_abundance),
+  "sosh_index_t" = (interior_v1_seabird_prey_predictors$sosh_index_of_abundance - mean(interior_v1_seabird_prey_predictors$sosh_index_of_abundance))/sd(interior_v1_seabird_prey_predictors$sosh_index_of_abundance),
+  
+  ## overlap metrics from stage 1 model
+  "pianka_o_cssif_prey_field_t" = (interior_v1_seabird_prey_predictors$pianka_o_cssif_prey_field_t - mean(interior_v1_seabird_prey_predictors$pianka_o_cssif_prey_field_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_prey_field_t),
+  "pianka_o_cssif_rf_t" = (interior_v1_seabird_prey_predictors$pianka_o_cssif_rf_t - mean(interior_v1_seabird_prey_predictors$pianka_o_cssif_rf_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_rf_t),
+  "pianka_o_cssif_sosh_t" = (interior_v1_seabird_prey_predictors$pianka_o_cssif_sosh_t - mean(interior_v1_seabird_prey_predictors$pianka_o_cssif_sosh_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_sosh_t),
+  "pianka_o_cssif_comu_t" = (interior_v1_seabird_prey_predictors$pianka_o_cssif_comu_t - mean(interior_v1_seabird_prey_predictors$pianka_o_cssif_comu_t))/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_comu_t),
+  
+  # uncertainty for indices of abundance and overlap metrics
+  # "Sigma_cssif_index_t" = cssif_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$cssif_index_of_abundance))^2,
+  "Sigma_prey_field_index_t" = prey_field_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$prey_field_index_of_abundance))^2,
+  "Sigma_rf_index_t" = rf_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$rf_index_of_abundance))^2,
+  "Sigma_comu_index_t" = comu_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$comu_index_of_abundance))^2,
+  "Sigma_sosh_index_t" = sosh_index_of_abundance_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$sosh_index_of_abundance))^2,
+  
+  "Sigma_pianka_o_cssif_prey_field_t" = pianka_o_cssif_prey_field_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_prey_field_t))^2,
+  "Sigma_pianka_o_cssif_rf_t" = pianka_o_cssif_rf_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_rf_t))^2,
+  "Sigma_pianka_o_cssif_sosh_t" = pianka_o_cssif_sosh_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_sosh_t))^2,
+  "Sigma_pianka_o_cssif_comu_t" = pianka_o_cssif_comu_cov_matrix_common_years_seabird_prey * (1/sd(interior_v1_seabird_prey_predictors$pianka_o_cssif_comu_t))^2
+)
+
+interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Params <- list(
+  ## SAR parameters
+  "beta_UCSF" = 0, # intercept term for UCSF
+  "beta_SRF_transported" = 0, # intercept term for SRF transported
+  "beta_SRF_non_transported" = 0, # intercept term for SRF non-transported
+  
+  "beta_outmigration_SRF" = 0,
+  "beta_outmigration_SRF2" = 0,
+  "beta_outmigration_UCSF" = 0,
+  "beta_outmigration_UCSF2" = 0,
+  
+  # "beta_cssif_index" = 0, # term to account for abundance in the survey
+  
+  # parameters for the influence of abundance of prey/predators
+  "beta_prey_field_index" = 0,
+  "beta_rf_index" = 0,
+  "beta_comu_index" = 0,
+  "beta_sosh_index" = 0,
+  
+  # parameters for the influence of overlap with prey/predators
+  "beta_ov_prey_field" = 0,
+  "beta_ov_rf" = 0,
+  "beta_ov_comu" = 0,
+  "beta_ov_sosh" = 0,
+  
+  # EiV latent variables (random effects)
+  # "cssif_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$cssif_index_t)),
+  "prey_field_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$prey_field_index_t)),
+  "pianka_o_cssif_prey_field_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$pianka_o_cssif_prey_field_t)),
+  "rf_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$rf_index_t)),
+  "pianka_o_cssif_rf_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$pianka_o_cssif_rf_t)),
+  "sosh_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$sosh_index_t)),
+  "pianka_o_cssif_sosh_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$pianka_o_cssif_sosh_t)),
+  "comu_index_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$comu_index_t)),
+  "pianka_o_cssif_comu_t_latent" = rnorm(length(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data$pianka_o_cssif_comu_t))
+  
+)
+
+# save workspace, in case model crashes
+# save.image(here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_workspace.rda"))
+# load("hake_SAR_workspace.RData")
+
+interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj = MakeADFun( data=interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Data, 
+                                                              parameters=interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Params, 
+                                                              random= c(# "cssif_index_t_latent", 
+                                                                "prey_field_index_t_latent", 
+                                                                "pianka_o_cssif_prey_field_t_latent",
+                                                                "rf_index_t_latent", 
+                                                                "pianka_o_cssif_rf_t_latent",
+                                                                "sosh_index_t_latent",
+                                                                "pianka_o_cssif_sosh_t_latent",
+                                                                "comu_index_t_latent",
+                                                                "pianka_o_cssif_comu_t_latent"),
+                                                              DLL = "06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov")
+
+
+# Optimize
+interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Opt = nlminb( start=interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj$par, obj=interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj$fn, grad=interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj$gr )
+interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Opt$SD = sdreport( interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj)
+interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_report = interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj$report()
+
+interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_output <- list(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj = interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Obj,
+                                                            interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Opt = interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_Opt,
+                                                            interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_report = interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_report)
+
+
+save(interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_output,
+     file = here::here("R", "06_stage2_SAR", "06.2.6_seabird_two_prey_no_salmon_index_one_model_SAR", "interior_06_2_6_seabird_prey_cssif_only_one_model_SAR_SEcov_output_zscored.rda"))
+```
