@@ -5,6 +5,7 @@ The directories in this repository are set us as follows
 ```
 -- Data ------- all input data files for project
 -- R/ ------- all scripts necessary to reproduce analysis
+  ------- This folder contains the primary R scripts (numbered 01-12), some helper scripts (primarily those ending with *_make_mesh.R), and a folder titled /functions/ that contains some additional helper functions
 -- docs ------- includes supplemental materials HTML output, so that it can be easily viewed on GitHub
 -- figures ------- various figures
 -- model_inputs/ ------- data processing output from scripts in the R/ folder that are inputs to later scripts.
